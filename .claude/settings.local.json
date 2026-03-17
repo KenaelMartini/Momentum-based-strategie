@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import event_driven; print\\(''Import OK''\\)\")",
+      "Bash(python event_driven.py)",
+      "Bash(python -c \":*)"
+    ]
+  }
+}

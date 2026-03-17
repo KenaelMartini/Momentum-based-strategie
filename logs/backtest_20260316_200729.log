@@ -1,0 +1,13 @@
+2026-03-16 20:07:29 | INFO | ============================================================
+2026-03-16 20:07:29 | INFO | ============================================================
+2026-03-16 20:07:29 | INFO |   Capital    : 100,000$
+2026-03-16 20:07:29 | INFO |   Mode cache : NON (IBKR live)
+2026-03-16 20:07:29 | INFO | ============================================================
+2026-03-16 20:07:29 | INFO |   Cache trouvé : data\processed\price_matrix.csv (33.7h)
+2026-03-16 20:07:29 | INFO |   Connexion à IBKR TWS...
+2026-03-16 20:07:29 | INFO | IBKRDataFetcher initialisé.
+2026-03-16 20:07:29 | INFO | Connecting to 127.0.0.1:7497 with clientId 1...
+2026-03-16 20:07:31 | INFO | Disconnecting
+2026-03-16 20:07:31 | ERROR | API connection failed: ConnectionRefusedError(22, 'Le système distant a refusé la connexion réseau', None, 1225, None)
+2026-03-16 20:07:31 | ERROR | Make sure API port on TWS/IBG is open
+2026-03-16 20:07:31 | ERROR | Pipeline interrompue.

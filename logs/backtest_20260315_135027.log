@@ -1,0 +1,24 @@
+2026-03-15 13:50:27 | INFO | ============================================================
+2026-03-15 13:50:27 | INFO | ============================================================
+2026-03-15 13:50:27 | INFO |   Capital    : 100,000$
+2026-03-15 13:50:27 | INFO |   Mode cache : NON (IBKR live)
+2026-03-15 13:50:27 | INFO | ============================================================
+2026-03-15 13:50:27 | INFO |   Cache trouvé : data\processed\price_matrix.csv (3.4h)
+2026-03-15 13:50:27 | INFO |   Cache chargé : 2518 jours × 33 actifs
+2026-03-15 13:50:27 | INFO |   Univers : 25 actions + 8 futures
+2026-03-15 13:50:27 | INFO | MomentumSignalGenerator initialisé : 2518 jours × 33 actifs
+2026-03-15 13:50:27 | INFO |   Fenêtre  21j : 932 dates valides calculées
+2026-03-15 13:50:27 | INFO |   Fenêtre  63j : 890 dates valides calculées
+2026-03-15 13:50:27 | INFO |   Fenêtre 126j : 827 dates valides calculées
+2026-03-15 13:50:27 | INFO |   Fenêtre 252j : 701 dates valides calculées
+2026-03-15 13:50:32 | INFO |   Signal stats | Long: 36.6% | Short: 25.0% | Neutre: 38.4%
+2026-03-15 13:50:32 | INFO | 
+=======================================================
+2026-03-15 13:50:32 | INFO | =======================================================
+2026-03-15 13:50:32 | INFO |   Signaux disponibles : 1965 dates
+2026-03-15 13:50:32 | INFO |   Calcul des poids cibles...
+2026-03-15 13:50:32 | INFO |   Propagation des poids (lag 1j)...
+2026-03-15 13:50:32 | INFO |   Application du risk scaling dynamique...
+2026-03-15 13:50:32 | INFO |   Calcul du P&L et des coûts...
+2026-03-15 13:50:32 | INFO |   Rendement: 83.2%
+2026-03-15 13:50:32 | INFO |   Turnover mensuel moyen : 76.9%

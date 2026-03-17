@@ -1,0 +1,22 @@
+============================================================
+  RÉSUMÉ DU BACKTEST — STRATÉGIE MOMENTUM
+============================================================
+  Date du run   : 2026-03-16 20:10:45
+  Période       : 2015-01-01 → 2024-12-31
+  Capital initial: 100,000$
+  Univers       : 33 actifs
+
+  RENDEMENTS
+    CAGR               : 13.18%
+    Rendement total    : 196.85%
+    Capital final      : 296,852$
+
+  RISQUE
+    Volatilité annuelle: 14.20%
+    Max Drawdown       : -22.46%
+    Sharpe Ratio       : 0.576
+    Sortino Ratio      : 0.781
+    Calmar Ratio       : 0.587
+
+  Turnover mensuel   : 93.2%
+============================================================
