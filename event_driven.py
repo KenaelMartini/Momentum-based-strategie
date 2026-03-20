@@ -4,6 +4,7 @@
 import os
 import sys
 import argparse
+import json
 import logging
 import warnings
 from pathlib import Path
@@ -11,7 +12,15 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
-
+from risk import (
+    RegimeEngine,
+    RegimeState,
+    apply_market_regime_overlay as apply_market_regime_overlay_helper,
+    apply_regime_weight_filter as apply_regime_weight_filter_helper,
+    build_regime_log_frame,
+    decide_event_driven_overlay,
+    summarize_regime_performance,
+)
 import numpy as np
 import pandas as pd
 
@@ -28,6 +37,10 @@ from config import (
     INITIAL_CAPITAL, RISK_FREE_RATE,
     MOMENTUM_WEIGHTS, SKIP_DAYS,
     LONG_QUANTILE, SHORT_QUANTILE,
+    BASELINE_MAX_CAGR_DEGRADATION,
+    BASELINE_MAX_MAX_DD_DEGRADATION,
+    BASELINE_MAX_TURNOVER_INCREASE,
+    BASELINE_MIN_ACCEPTED_SHARPE,
     TRANSACTION_COST_BPS, SLIPPAGE_BPS,
 )
 
@@ -64,10 +77,12 @@ class MarketEvent:
 
 @dataclass
 class SignalEvent:
-    date      : pd.Timestamp
-    weights   : dict
-    regime    : float
-    signal    : Signal
+    date: pd.Timestamp
+    weights: dict
+    regime: float = 0.0
+    regime_state: str = "UNKNOWN"
+    regime_confidence: float = 0.0
+    signal: Signal = Signal.FLAT
     event_type: EventType = EventType.SIGNAL
 
 @dataclass
@@ -90,17 +105,40 @@ class FillEvent:
 
 @dataclass
 class PortfolioStats:
-    date           : pd.Timestamp
+    date: pd.Timestamp
     portfolio_value: float
-    cash           : float
+    cash: float
     positions_value: float
-    daily_return   : float
-    realized_vol   : float
-    expected_vol   : float
-    drawdown       : float
-    regime_score   : float
-    positions      : dict
-    turnover       : float
+    daily_return: float
+    realized_vol: float
+    expected_vol: float
+    drawdown: float
+    regime_score: float
+    regime_state: str = "UNKNOWN"
+    regime_confidence: float = 0.0
+    trading_suspended: bool = False
+    dd_max_stop: bool = False
+    suspension_reason: str = ""
+    suspended_days: int = 0
+    positions: dict = None
+    turnover: float = 0.0
+    rebalancing_day: bool = False
+    n_orders: int = 0
+    risk_scaling: float = float("nan")
+    rebal_threshold: float = float("nan")
+    rebal_threshold_context: str = ""
+    signal_generation_reason: str = ""
+    gross_signal_raw: float = float("nan")
+    gross_after_constraints: float = float("nan")
+    gross_after_risk_manager: float = float("nan")
+    gross_after_rebal_threshold: float = float("nan")
+    gross_after_old_regime_filter: float = float("nan")
+    gross_after_market_overlay: float = float("nan")
+    old_regime_filter_scale: float = float("nan")
+    applied_market_overlay_scale: float = float("nan")
+    applied_market_overlay_active: bool = False
+    applied_market_overlay_reason: str = ""
+    final_turnover: float = float("nan")
 
 
 # ============================================================
@@ -167,58 +205,94 @@ class MomentumSignalGenerator:
     Score_i = Σ w_k * log(P_{T-skip} / P_{T-skip-window_k})
     """
 
-    def __init__(self, data_handler, momentum_weights=None,
-                 skip_days=10, long_quantile=0.70, short_quantile=0.30):
-        self.data       = data_handler
-        self.weights    = momentum_weights or MOMENTUM_WEIGHTS
-        self.skip_days  = skip_days
-        self.long_q     = long_quantile
-        self.short_q    = short_quantile
+    def __init__(
+        self,
+        data_handler,
+        momentum_weights=None,
+        skip_days=10,
+        long_quantile=0.70,
+        short_quantile=0.30,
+        regime_engine=None,
+    ):
+        self.data = data_handler
+        self.weights = momentum_weights or MOMENTUM_WEIGHTS
+        self.skip_days = skip_days
+        self.long_q = long_quantile
+        self.short_q = short_quantile
         self.max_window = max(self.weights.keys())
+        self.regime_engine = regime_engine or RegimeEngine()
 
     def compute_signal(self, date):
         required = self.max_window + self.skip_days + 10
-        prices   = self.data.get_history(date, required)
-        if len(prices) < required:
+        prices = self.data.get_history(date, max(required, 300))
+        if len(prices) < max(required, 200):
             return None
 
-        # Fenêtre séparée pour le régime — 300j minimum
-        prices_regime = self.data.get_history(date, 300)
-        regime_score, multiplier = self._compute_regime(prices_regime)
+        regime_snapshot = self.regime_engine.compute(prices)
+        if regime_snapshot is None:
+            return None
 
-        # Score momentum : somme pondérée des rendements multi-fenêtres
+        # Score momentum
         scores = pd.Series(0.0, index=prices.columns)
         for window, weight in self.weights.items():
-            idx_end   = -self.skip_days if self.skip_days > 0 else len(prices)
+            idx_end = -self.skip_days if self.skip_days > 0 else len(prices)
             idx_start = -(window + self.skip_days)
-            p_end     = prices.iloc[idx_end]
-            p_start   = prices.iloc[idx_start]
-            ret       = np.log(p_end / p_start).replace([np.inf, -np.inf], np.nan).fillna(0)
-            scores   += weight * ret
+            p_end = prices.iloc[idx_end]
+            p_start = prices.iloc[idx_start]
+            ret = np.log(p_end / p_start).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            scores += weight * ret
 
-        regime_score, multiplier = self._compute_regime(prices)
+        # Filtrage simple selon régime
+        if regime_snapshot.state == RegimeState.RISK_OFF and regime_snapshot.confidence > 0.60:
+            return SignalEvent(
+                date=date,
+                weights={},
+                regime=regime_snapshot.composite_score,
+                regime_state=regime_snapshot.state.value,
+                regime_confidence=regime_snapshot.confidence,
+                signal=Signal.FLAT,
+            )
 
-        if multiplier < 0.05:
-            return SignalEvent(date=date, weights={}, regime=regime_score, signal=Signal.FLAT)
+        valid = scores.dropna()
+        q_high = valid.quantile(self.long_q)
+        q_low = valid.quantile(self.short_q)
 
-        valid   = scores.dropna()
-        q_high  = valid.quantile(self.long_q)
-        q_low   = valid.quantile(self.short_q)
-        longs   = valid[valid >= q_high].index.tolist()
-        shorts  = valid[valid <= q_low].index.tolist()
+        longs = valid[valid >= q_high].index.tolist()
+        shorts = valid[valid <= q_low].index.tolist()
 
         weights_dict = {}
 
-        # Poids borné à 10% max par position (diversification)
-        base_weight = min(multiplier / max(len(longs), 1), 0.10)
+        if regime_snapshot.state == RegimeState.TREND:
+            short_multiplier = 0.70
+        elif regime_snapshot.state == RegimeState.RISK_ON:
+            short_multiplier = 0.40
+        elif regime_snapshot.state == RegimeState.TRANSITION:
+            short_multiplier = 0.20
+        else:
+            short_multiplier = 0.00
+
+        base_weight = min(
+            regime_snapshot.exposure_multiplier / max(len(longs), 1),
+            0.10
+        )
 
         for t in longs:
             weights_dict[t] = base_weight
-        for t in shorts:
-            weights_dict[t] = -base_weight * 0.5
 
-        return SignalEvent(date=date, weights=weights_dict,
-                          regime=regime_score, signal=Signal.LONG)
+        for t in shorts:
+            weights_dict[t] = -base_weight * short_multiplier
+
+        signal = Signal.FLAT if len(weights_dict) == 0 else Signal.LONG
+
+        return SignalEvent(
+            date=date,
+            weights=weights_dict,
+            regime=regime_snapshot.composite_score,
+            regime_state=regime_snapshot.state.value,
+            regime_confidence=regime_snapshot.confidence,
+            signal=signal,
+        )
+    
 
     def _compute_regime(self, prices: pd.DataFrame):
         scores = []
@@ -291,7 +365,12 @@ class Portfolio:
             if not np.isnan(v):
                 self.prices[t] = float(v)
 
-    def generate_orders(self, signal: SignalEvent, prices: pd.Series) -> list:
+    def generate_orders(
+        self,
+        signal: SignalEvent,
+        prices: pd.Series,
+        rebal_threshold: float = 0.015,
+    ) -> list:
         orders   = []
         pv       = self.portfolio_value
         target_w = signal.weights
@@ -305,14 +384,13 @@ class Portfolio:
                                              quantity=-self.positions[t], price=p))
 
         # Ajuster les positions cibles
-        REBAL_THRESHOLD = 0.015
         for t, w in target_w.items():
             p = self.prices.get(t, 0.0)
             if p <= 0:
                 continue
             current_w = self.positions.get(t, 0) * p / pv if pv > 0 else 0
             delta_w   = w - current_w
-            if abs(delta_w) < REBAL_THRESHOLD:
+            if abs(delta_w) < rebal_threshold:
                 continue
             delta_val = delta_w * pv
             orders.append(OrderEvent(date=signal.date, ticker=t,
@@ -329,30 +407,72 @@ class Portfolio:
             del self.positions[t]
         self.cash -= cost
 
-    def compute_stats(self, date, regime_score, turnover) -> PortfolioStats:
-        pv        = self.portfolio_value
+    def compute_stats(
+        self,
+        date,
+        regime_score,
+        turnover,
+        regime_state="UNKNOWN",
+        regime_confidence=0.0,
+        trading_suspended=False,
+        dd_max_stop=False,
+        suspension_reason="",
+        suspended_days=0,
+        diagnostics=None,
+    ) -> PortfolioStats:
+        diagnostics = diagnostics or {}
+        pv = self.portfolio_value
         daily_ret = (pv / self.prev_value - 1) if self.prev_value > 0 else 0.0
+
         self.returns_history.append(daily_ret)
         self.prev_value = pv
         self.peak_value = max(self.peak_value, pv)
-        drawdown        = (pv - self.peak_value) / self.peak_value
+        drawdown = (pv - self.peak_value) / self.peak_value if self.peak_value > 0 else 0.0
 
-        # Volatilité réalisée rolling 21j (annualisée)
         recent = self.returns_history[-21:]
-        rv = float(np.std(recent) * np.sqrt(252)) if len(recent) >= 5 else 0.0
+        realized_vol = float(np.std(recent) * np.sqrt(252)) if len(recent) >= 5 else 0.0
 
-        # Proxy GARCH : EV = 0.94 * vol_long + 0.06 * vol_court
         long_r = self.returns_history[-63:]
-        lv = float(np.std(long_r) * np.sqrt(252)) if len(long_r) >= 21 else rv
-        ev = 0.94 * lv + 0.06 * rv
+        long_vol = float(np.std(long_r) * np.sqrt(252)) if len(long_r) >= 21 else realized_vol
+        expected_vol = 0.94 * long_vol + 0.06 * realized_vol
 
         stats = PortfolioStats(
-            date=date, portfolio_value=pv, cash=self.cash,
-            positions_value=self.positions_value, daily_return=daily_ret,
-            realized_vol=rv, expected_vol=ev, drawdown=drawdown,
-            regime_score=regime_score, positions=dict(self.positions),
+            date=date,
+            portfolio_value=pv,
+            cash=self.cash,
+            positions_value=self.positions_value,
+            daily_return=daily_ret,
+            realized_vol=realized_vol,
+            expected_vol=expected_vol,
+            drawdown=drawdown,
+            regime_score=regime_score,
+            regime_state=regime_state,
+            regime_confidence=regime_confidence,
+            trading_suspended=bool(trading_suspended),
+            dd_max_stop=bool(dd_max_stop),
+            suspension_reason=str(suspension_reason or ""),
+            suspended_days=int(suspended_days or 0),
+            positions=dict(self.positions),
             turnover=turnover,
+            rebalancing_day=bool(diagnostics.get("rebalancing_day", False)),
+            n_orders=int(diagnostics.get("n_orders", 0)),
+            risk_scaling=float(diagnostics.get("risk_scaling", float("nan"))),
+            rebal_threshold=float(diagnostics.get("rebal_threshold", float("nan"))),
+            rebal_threshold_context=str(diagnostics.get("rebal_threshold_context", "")),
+            signal_generation_reason=str(diagnostics.get("signal_generation_reason", "")),
+            gross_signal_raw=float(diagnostics.get("gross_signal_raw", float("nan"))),
+            gross_after_constraints=float(diagnostics.get("gross_after_constraints", float("nan"))),
+            gross_after_risk_manager=float(diagnostics.get("gross_after_risk_manager", float("nan"))),
+            gross_after_rebal_threshold=float(diagnostics.get("gross_after_rebal_threshold", float("nan"))),
+            gross_after_old_regime_filter=float(diagnostics.get("gross_after_old_regime_filter", float("nan"))),
+            gross_after_market_overlay=float(diagnostics.get("gross_after_market_overlay", float("nan"))),
+            old_regime_filter_scale=float(diagnostics.get("old_regime_filter_scale", float("nan"))),
+            applied_market_overlay_scale=float(diagnostics.get("applied_market_overlay_scale", float("nan"))),
+            applied_market_overlay_active=bool(diagnostics.get("applied_market_overlay_active", False)),
+            applied_market_overlay_reason=str(diagnostics.get("applied_market_overlay_reason", "")),
+            final_turnover=float(diagnostics.get("final_turnover", float("nan"))),
         )
+
         self.history.append(stats)
         return stats
 
@@ -597,6 +717,113 @@ class LiveVisualizer3D:
         return str(path)
 
 
+def _deprecated_apply_regime_weight_filter(weights: dict, risk_snapshot, return_meta: bool = False):
+    """
+    Filtre doux d'exposition selon le régime.
+    Préserve la diversification et réduit seulement la taille.
+
+    Règles :
+    - CRISIS  -> flat complet
+    - STRESS  -> réduction modérée
+    - NORMAL  -> légère réduction si score moyen/faible
+    - BULL    -> exposition quasi normale
+
+    Paramètres
+    ----------
+    weights : dict
+        Dictionnaire {ticker: poids cible}
+    risk_snapshot : object
+        Objet du risk manager contenant au minimum :
+        - regime.name
+        - regime_score
+
+    Retour
+    ------
+    dict
+        Dictionnaire de poids filtrés
+    """
+    if not weights:
+        empty_meta = {
+            "applied_scale": 1.0,
+            "regime_name": getattr(getattr(risk_snapshot, "regime", None), "name", "NORMAL"),
+            "regime_score": float(getattr(risk_snapshot, "regime_score", 0.75) or 0.75),
+            "hard_flat": False,
+        }
+        return ({}, empty_meta) if return_meta else {}
+
+    regime_name = getattr(risk_snapshot.regime, "name", "NORMAL")
+    regime_score = float(getattr(risk_snapshot, "regime_score", 0.75) or 0.75)
+
+    # 1) Hard regime filter
+    if regime_name == "CRISIS":
+        crisis_meta = {
+            "applied_scale": 0.0,
+            "regime_name": regime_name,
+            "regime_score": regime_score,
+            "hard_flat": True,
+        }
+        return ({}, crisis_meta) if return_meta else {}
+
+    # 2) Base scaling
+    if regime_name == "STRESS":
+        scale = 0.60
+    elif regime_name == "NORMAL":
+        scale = 0.92
+    elif regime_name == "BULL":
+        scale = 1.05
+    else:
+        scale = 0.95
+
+    # 3) Score filter (sans override du CRISIS)
+    if regime_score < 0.35:
+        scale *= 0.50
+    elif regime_score < 0.50:
+        scale *= 0.75
+    elif regime_score < 0.70:
+        scale *= 0.90
+    elif regime_score >= 0.85:
+        scale *= 1.05
+
+    # 4) Application du scaling
+    filtered = {}
+    for ticker, weight in weights.items():
+        new_weight = weight * scale
+        if abs(new_weight) > 1e-6:
+            filtered[ticker] = new_weight
+
+    meta = {
+        "applied_scale": float(scale),
+        "regime_name": regime_name,
+        "regime_score": regime_score,
+        "hard_flat": False,
+    }
+    return (filtered, meta) if return_meta else filtered
+
+
+def _deprecated_apply_market_regime_overlay(weights: dict, overlay_decision) -> dict:
+    """
+    Overlay d'exposition piloté par le nouveau moteur de régime marché.
+
+    Phase d'intégration prudente:
+    - TREND / RISK_ON   -> pas d'overlay
+    - TRANSITION        -> réduction modérée
+    - RISK_OFF          -> réduction forte
+    """
+    if not weights:
+        return {}
+
+    scale = float(getattr(overlay_decision, "scale", 1.0) or 1.0)
+    if scale >= 0.999:
+        return dict(weights)
+
+    filtered = {}
+    for ticker, weight in weights.items():
+        new_weight = weight * scale
+        if abs(new_weight) > 1e-6:
+            filtered[ticker] = new_weight
+
+    return filtered
+
 # ============================================================
 # MOTEUR PRINCIPAL
 # ============================================================
@@ -634,8 +861,12 @@ class EventDrivenEngine:
         self.portfolio    = Portfolio(initial_capital)
         self.broker       = SimulatedBroker()
         self.visualizer   = LiveVisualizer3D(update_every=21)
+        self.market_regime_engine = RegimeEngine(track_history=True)
         self.n_trades     = 0
         self.last_rebal_date = None
+        self.last_market_regime_state = None
+        self.final_metrics = {}
+        self.rebal_diagnostics = []
         self.prev_prices     = None   # nécessaire pour les rendements cross-actifs
 
     def run(self) -> dict:
@@ -665,19 +896,52 @@ class EventDrivenEngine:
 
             # ── 3 + 4. Risk check + Signal mensuel ───────────
             signal_event = None
-            turnover     = 0.0
+            turnover = 0.0
 
             risk_snapshot = self.risk_manager.update(
-                date              = date,
-                prices            = prices,
-                portfolio_value   = self.portfolio.portfolio_value,
-                current_positions = self.portfolio.positions,
-                entry_prices      = {t: self.portfolio.prices.get(t, 0)
-                                     for t in self.portfolio.positions},
-                prev_prices       = self.prev_prices,
+                date=date,
+                prices=prices,
+                portfolio_value=self.portfolio.portfolio_value,
+                current_positions=self.portfolio.positions,
+                entry_prices={t: self.portfolio.prices.get(t, 0) for t in self.portfolio.positions},
+                prev_prices=self.prev_prices,
             )
             self.signal_gen.update_ewma_vol(prices, self.prev_prices)
             regime_score = risk_snapshot.regime_score
+            daily_rebal_diagnostics = {
+                "rebalancing_day": False,
+                "n_orders": 0,
+                "risk_scaling": float(getattr(risk_snapshot, "risk_scaling", float("nan"))),
+                "rebal_threshold": float("nan"),
+                "rebal_threshold_context": "",
+                "signal_generation_reason": "",
+                "gross_signal_raw": float("nan"),
+                "gross_after_constraints": float("nan"),
+                "gross_after_risk_manager": float("nan"),
+                "gross_after_rebal_threshold": float("nan"),
+                "gross_after_old_regime_filter": float("nan"),
+                "gross_after_market_overlay": float("nan"),
+                "old_regime_filter_scale": float("nan"),
+                "applied_market_overlay_scale": float("nan"),
+                "applied_market_overlay_active": False,
+                "applied_market_overlay_reason": "",
+                "final_turnover": float("nan"),
+            }
+
+            market_regime_snapshot = self.market_regime_engine.compute(
+                self.data_handler.get_history(date, 300)
+            )
+            market_overlay_decision = decide_event_driven_overlay(market_regime_snapshot)
+            if market_regime_snapshot is not None:
+                market_regime_state = market_regime_snapshot.state.value
+                if market_regime_state != self.last_market_regime_state:
+                    logger.info(
+                        f"  Market regime {date.date()} | {market_regime_state} | "
+                        f"Score: {market_regime_snapshot.composite_score:.2f} | "
+                        f"Conf: {market_regime_snapshot.confidence:.2f} | "
+                        f"Expo: {market_regime_snapshot.exposure_multiplier:.2f}x"
+                    )
+                    self.last_market_regime_state = market_regime_state
 
             # Fermeture immédiate des stop-loss individuels
             for symbol in risk_snapshot.positions_to_close:
@@ -713,15 +977,98 @@ class EventDrivenEngine:
 
             if rebal_today and not risk_snapshot.trading_suspended:
                 self.last_rebal_date = date
-                weights = self.signal_gen.compute_weights(date, risk_snapshot)
+
+                weights = self.signal_gen.compute_weights(
+                    date,
+                    risk_snapshot,
+                    market_regime_state=getattr(getattr(market_regime_snapshot, "state", None), "value", ""),
+                )
+                signal_diagnostics = dict(getattr(self.signal_gen, "last_diagnostics", {}) or {})
+                weights, old_regime_meta = apply_regime_weight_filter_helper(
+                    weights,
+                    risk_snapshot,
+                    return_meta=True,
+                )
+                gross_before_overlay = sum(abs(weight) for weight in weights.values())
+                weights = apply_market_regime_overlay_helper(weights, market_overlay_decision)
+                gross_after_overlay = sum(abs(weight) for weight in weights.values())
+                if market_overlay_decision.active and gross_before_overlay > 0:
+                    logger.info(
+                        f"  Overlay marche {date.date()} | {market_overlay_decision.state} | "
+                        f"{market_overlay_decision.reason} | "
+                        f"Gross: {gross_before_overlay:.2f}x -> {gross_after_overlay:.2f}x"
+                    )
+
                 signal_event = SignalEvent(
-                    date=date, weights=weights, regime=regime_score,
+                    date=date,
+                    weights=weights,
+                    regime=risk_snapshot.regime_score,
+                    regime_state=getattr(getattr(risk_snapshot, "regime", None), "name", "UNKNOWN"),
+                    regime_confidence=getattr(risk_snapshot, "confidence", 0.0),
                     signal=Signal.FLAT if not weights else Signal.HOLD
                 )
+
                 orders = self.portfolio.generate_orders(signal_event, prices)
+
                 pv = self.portfolio.portfolio_value
                 if pv > 0 and orders:
                     turnover = sum(abs(o.quantity * o.price) for o in orders) / pv
+
+                daily_rebal_diagnostics = {
+                    "rebalancing_day": True,
+                    "n_orders": int(len(orders)),
+                    "risk_scaling": float(getattr(risk_snapshot, "risk_scaling", float("nan"))),
+                    "rebal_threshold": float(signal_diagnostics.get("rebal_threshold", float("nan"))),
+                    "rebal_threshold_context": str(signal_diagnostics.get("rebal_threshold_context", "")),
+                    "signal_generation_reason": str(signal_diagnostics.get("signal_reason", "")),
+                    "gross_signal_raw": float(signal_diagnostics.get("gross_signal_raw", float("nan"))),
+                    "gross_after_constraints": float(signal_diagnostics.get("gross_after_constraints", float("nan"))),
+                    "gross_after_risk_manager": float(signal_diagnostics.get("gross_after_risk_manager", float("nan"))),
+                    "gross_after_rebal_threshold": float(signal_diagnostics.get("gross_after_rebal_threshold", float("nan"))),
+                    "gross_after_old_regime_filter": float(gross_before_overlay),
+                    "gross_after_market_overlay": float(gross_after_overlay),
+                    "old_regime_filter_scale": float(old_regime_meta.get("applied_scale", float("nan"))),
+                    "applied_market_overlay_scale": float(getattr(market_overlay_decision, "scale", float("nan"))),
+                    "applied_market_overlay_active": bool(getattr(market_overlay_decision, "active", False)),
+                    "applied_market_overlay_reason": str(getattr(market_overlay_decision, "reason", "")),
+                    "final_turnover": float(turnover),
+                }
+                self.rebal_diagnostics.append(
+                    {
+                        "date": date,
+                        "risk_regime_state": getattr(getattr(risk_snapshot, "regime", None), "name", "UNKNOWN"),
+                        "risk_regime_score": float(getattr(risk_snapshot, "regime_score", float("nan"))),
+                        "risk_scaling": float(getattr(risk_snapshot, "risk_scaling", float("nan"))),
+                        "rebal_threshold": float(signal_diagnostics.get("rebal_threshold", float("nan"))),
+                        "rebal_threshold_context": str(signal_diagnostics.get("rebal_threshold_context", "")),
+                        "old_regime_filter_scale": float(old_regime_meta.get("applied_scale", float("nan"))),
+                        "market_regime_state": getattr(getattr(market_regime_snapshot, "state", None), "value", ""),
+                        "market_regime_score": float(getattr(market_regime_snapshot, "composite_score", float("nan"))),
+                        "market_regime_confidence": float(getattr(market_regime_snapshot, "confidence", float("nan"))),
+                        "market_overlay_scale": float(getattr(market_overlay_decision, "scale", float("nan"))),
+                        "market_overlay_active": bool(getattr(market_overlay_decision, "active", False)),
+                        "market_overlay_reason": str(getattr(market_overlay_decision, "reason", "")),
+                        "signal_generation_reason": str(signal_diagnostics.get("signal_reason", "")),
+                        "gross_signal_raw": float(signal_diagnostics.get("gross_signal_raw", float("nan"))),
+                        "gross_after_constraints": float(signal_diagnostics.get("gross_after_constraints", float("nan"))),
+                        "gross_after_risk_manager": float(signal_diagnostics.get("gross_after_risk_manager", float("nan"))),
+                        "gross_after_rebal_threshold": float(signal_diagnostics.get("gross_after_rebal_threshold", float("nan"))),
+                        "gross_after_old_regime_filter": float(gross_before_overlay),
+                        "gross_after_market_overlay": float(gross_after_overlay),
+                        "n_orders": int(len(orders)),
+                        "turnover": float(turnover),
+                    }
+                )
+                logger.info(
+                    f"  Rebal diag {date.date()} | "
+                    f"Raw: {daily_rebal_diagnostics['gross_signal_raw']:.2f}x | "
+                    f"Risk: {daily_rebal_diagnostics['gross_after_risk_manager']:.2f}x | "
+                    f"Thr: {daily_rebal_diagnostics['rebal_threshold']:.3f} | "
+                    f"Old regime: {daily_rebal_diagnostics['gross_after_old_regime_filter']:.2f}x | "
+                    f"Market: {daily_rebal_diagnostics['gross_after_market_overlay']:.2f}x | "
+                    f"Orders: {len(orders)} | TO: {turnover:.1%}"
+                )
+
                 for order in orders:
                     self.broker.submit_order(order)
 
@@ -729,7 +1076,17 @@ class EventDrivenEngine:
 
             # ── 5. Statistiques du portefeuille ──────────────
             stats = self.portfolio.compute_stats(
-                date=date, regime_score=regime_score, turnover=turnover)
+                date=date,
+                regime_score=regime_score,
+                turnover=turnover,
+                regime_state=getattr(getattr(risk_snapshot, "regime", None), "name", "UNKNOWN"),
+                regime_confidence=getattr(risk_snapshot, "confidence", 0.0),
+                trading_suspended=getattr(risk_snapshot, "trading_suspended", False),
+                dd_max_stop=getattr(risk_snapshot, "dd_max_stop", False),
+                suspension_reason=getattr(risk_snapshot, "suspension_reason", ""),
+                suspended_days=getattr(risk_snapshot, "suspended_days", 0),
+                diagnostics=daily_rebal_diagnostics,
+            )
 
             # ── 6. Visualisation live ─────────────────────────
             if self.live_viz:
@@ -776,9 +1133,16 @@ class EventDrivenEngine:
         logger.info(f"  Nb trades    : {self.n_trades}")
         logger.info(f"  Turnover/an  : {avg_to:.1%}")
 
-        return {"cagr": cagr, "sharpe": sharpe, "max_dd": max_dd,
-                "calmar": calmar, "final_value": pv[-1],
-                "n_trades": self.n_trades, "avg_turnover": avg_to}
+        self.final_metrics = {
+            "cagr": cagr,
+            "sharpe": sharpe,
+            "max_dd": max_dd,
+            "calmar": calmar,
+            "final_value": pv[-1],
+            "n_trades": self.n_trades,
+            "avg_turnover": avg_to,
+        }
+        return self.final_metrics
 
     def save_results(self) -> dict:
         history = self.portfolio.history
@@ -791,8 +1155,37 @@ class EventDrivenEngine:
             "date": s.date, "portfolio_value": s.portfolio_value,
             "daily_return": s.daily_return, "realized_vol": s.realized_vol,
             "expected_vol": s.expected_vol, "drawdown": s.drawdown,
-            "regime_score": s.regime_score, "turnover": s.turnover,
+            "regime_score": s.regime_score, "regime_state": s.regime_state,
+            "regime_confidence": s.regime_confidence,
+            "trading_suspended": s.trading_suspended,
+            "dd_max_stop": s.dd_max_stop,
+            "suspension_reason": s.suspension_reason,
+            "suspended_days": s.suspended_days,
+            "turnover": s.turnover,
+            "rebalancing_day": s.rebalancing_day,
+            "n_orders": s.n_orders,
+            "risk_scaling": s.risk_scaling,
+            "rebal_threshold": s.rebal_threshold,
+            "rebal_threshold_context": s.rebal_threshold_context,
+            "signal_generation_reason": s.signal_generation_reason,
+            "gross_signal_raw": s.gross_signal_raw,
+            "gross_after_constraints": s.gross_after_constraints,
+            "gross_after_risk_manager": s.gross_after_risk_manager,
+            "gross_after_rebal_threshold": s.gross_after_rebal_threshold,
+            "gross_after_old_regime_filter": s.gross_after_old_regime_filter,
+            "gross_after_market_overlay": s.gross_after_market_overlay,
+            "old_regime_filter_scale": s.old_regime_filter_scale,
+            "applied_market_overlay_scale": s.applied_market_overlay_scale,
+            "applied_market_overlay_active": s.applied_market_overlay_active,
+            "applied_market_overlay_reason": s.applied_market_overlay_reason,
+            "final_turnover": s.final_turnover,
         } for s in history])
+        stats_df["date"] = pd.to_datetime(stats_df["date"])
+
+        market_regime_df = self.market_regime_engine.history_frame()
+        if not market_regime_df.empty:
+            market_regime_df["date"] = pd.to_datetime(market_regime_df["date"])
+            stats_df = stats_df.merge(market_regime_df, on="date", how="left")
 
         stats_path = self.output_dir / f"stats_{ts}.csv"
         stats_df.to_csv(stats_path, index=False)
@@ -803,7 +1196,59 @@ class EventDrivenEngine:
 
         self._compare_with_vectorized(stats_df)
 
-        return {"stats": str(stats_path), "dashboard": html_path}
+        files = {"stats": str(stats_path), "dashboard": html_path}
+
+        if self.rebal_diagnostics:
+            rebal_df = pd.DataFrame(self.rebal_diagnostics)
+            rebal_path = self.output_dir / f"rebal_diagnostics_{ts}.csv"
+            rebal_df.to_csv(rebal_path, index=False)
+            logger.info(f"  Rebal diagnostics sauvegardes : {rebal_path}")
+            files["rebal_diagnostics"] = str(rebal_path)
+
+        regime_log_df = build_regime_log_frame(stats_df)
+        if not regime_log_df.empty:
+            regime_log_path = self.output_dir / f"regimes_{ts}.csv"
+            regime_log_df.to_csv(regime_log_path, index=False)
+            logger.info(f"  Regimes sauvegardes : {regime_log_path}")
+            files["regimes"] = str(regime_log_path)
+
+        regime_perf_df = summarize_regime_performance(
+            stats_df,
+            risk_free_rate=RISK_FREE_RATE,
+        )
+        if not regime_perf_df.empty:
+            regime_perf_path = self.output_dir / f"regime_performance_{ts}.csv"
+            regime_perf_df.to_csv(regime_perf_path, index=False)
+            logger.info(f"  Performance par regime : {regime_perf_path}")
+            logger.info("\n" + "=" * 60)
+            logger.info("  PERFORMANCE PAR REGIME")
+            logger.info("=" * 60)
+            for _, row in regime_perf_df.iterrows():
+                sharpe_text = f"{row['sharpe']:.2f}" if pd.notna(row["sharpe"]) else "n/a"
+                return_text = (
+                    f"{row['annualized_return']:.2%}"
+                    if pd.notna(row["annualized_return"])
+                    else "n/a"
+                )
+                dd_text = f"{row['max_drawdown']:.2%}" if pd.notna(row["max_drawdown"]) else "n/a"
+                logger.info(
+                    f"  {row['regime_state']:10s} | {int(row['days']):4d}j | "
+                    f"Sharpe: {sharpe_text:>6s} | "
+                    f"AnnRet: {return_text:>8s} | "
+                    f"MaxDD: {dd_text:>8s} | "
+                    f"Turnover/an: {row['avg_turnover'] * 252:>7.1%}"
+                )
+            files["regime_performance"] = str(regime_perf_path)
+
+        baseline_comparison = self._compare_with_baseline_reference()
+        if baseline_comparison is not None:
+            baseline_path = self.output_dir / f"baseline_comparison_{ts}.json"
+            with baseline_path.open("w", encoding="utf-8") as handle:
+                json.dump(baseline_comparison, handle, indent=2)
+            logger.info(f"  Comparaison baseline : {baseline_path}")
+            files["baseline_comparison"] = str(baseline_path)
+
+        return files
 
     def _compare_with_vectorized(self, stats_df: pd.DataFrame):
         """
@@ -817,15 +1262,20 @@ class EventDrivenEngine:
         if not ret_files:
             return
 
-        vec_ret  = pd.read_csv(ret_files[-1], index_col=0, parse_dates=True).iloc[:, 0].dropna()
-        ed_ret   = pd.Series(stats_df["daily_return"].values,
-                             index=pd.to_datetime(stats_df["date"]))
-        rf_d     = (1 + RISK_FREE_RATE) ** (1/252) - 1
+        vec_ret = pd.read_csv(ret_files[-1], index_col=0, parse_dates=True).iloc[:, 0].dropna()
+        ed_ret = pd.Series(
+            stats_df["daily_return"].values,
+            index=pd.to_datetime(stats_df["date"]),
+        ).dropna()
+        rf_d = (1 + RISK_FREE_RATE) ** (1/252) - 1
 
         vec_sharpe = (vec_ret.mean() - rf_d) / vec_ret.std() * np.sqrt(252)
-        ed_sharpe  = (ed_ret.mean() - rf_d) / ed_ret.std() * np.sqrt(252)
-        vec_cagr   = (1 + vec_ret.mean()) ** 252 - 1
-        ed_cagr    = (1 + ed_ret.mean()) ** 252 - 1
+        ed_sharpe = (ed_ret.mean() - rf_d) / ed_ret.std() * np.sqrt(252)
+
+        vec_total_return = float((1.0 + vec_ret).prod() - 1.0)
+        ed_total_return = float((1.0 + ed_ret).prod() - 1.0)
+        vec_cagr = (1.0 + vec_total_return) ** (252 / len(vec_ret)) - 1.0 if len(vec_ret) else 0.0
+        ed_cagr = (1.0 + ed_total_return) ** (252 / len(ed_ret)) - 1.0 if len(ed_ret) else 0.0
 
         logger.info("\n" + "="*60)
         logger.info("  COMPARAISON VECTORISÉ vs EVENT-DRIVEN")
@@ -836,6 +1286,159 @@ class EventDrivenEngine:
         logger.info(f"  {'Sharpe':15s} {vec_sharpe:>12.3f} {ed_sharpe:>14.3f} {ed_sharpe/vec_sharpe:>7.2f}x")
         logger.info("  → Ratio proche de 1.0 = pas de biais look-ahead ✅")
 
+
+
+    def _evaluate_baseline_verdict(
+        self,
+        baseline_metrics: dict,
+        current_metrics: dict,
+        delta: dict,
+    ) -> dict:
+        baseline_cagr = float(baseline_metrics.get("cagr", 0.0))
+        baseline_max_dd = float(baseline_metrics.get("max_drawdown", 0.0))
+        baseline_turnover = float(baseline_metrics.get("annualized_turnover", 0.0))
+
+        guardrails = {
+            "sharpe_floor": {
+                "passed": current_metrics["sharpe"] >= BASELINE_MIN_ACCEPTED_SHARPE,
+                "threshold": BASELINE_MIN_ACCEPTED_SHARPE,
+                "actual": current_metrics["sharpe"],
+            },
+            "cagr_drift": {
+                "passed": current_metrics["cagr"] >= baseline_cagr - BASELINE_MAX_CAGR_DEGRADATION,
+                "threshold": baseline_cagr - BASELINE_MAX_CAGR_DEGRADATION,
+                "actual": current_metrics["cagr"],
+            },
+            "max_dd_drift": {
+                "passed": current_metrics["max_drawdown"] >= baseline_max_dd - BASELINE_MAX_MAX_DD_DEGRADATION,
+                "threshold": baseline_max_dd - BASELINE_MAX_MAX_DD_DEGRADATION,
+                "actual": current_metrics["max_drawdown"],
+            },
+            "turnover_drift": {
+                "passed": current_metrics["annualized_turnover"] <= baseline_turnover + BASELINE_MAX_TURNOVER_INCREASE,
+                "threshold": baseline_turnover + BASELINE_MAX_TURNOVER_INCREASE,
+                "actual": current_metrics["annualized_turnover"],
+            },
+        }
+
+        severe_failures = []
+        if delta["sharpe"] < -0.02:
+            severe_failures.append("SHARPE_REGRESSION")
+        if current_metrics["cagr"] < baseline_cagr - BASELINE_MAX_CAGR_DEGRADATION:
+            severe_failures.append("CAGR_REGRESSION")
+        if current_metrics["max_drawdown"] < baseline_max_dd - BASELINE_MAX_MAX_DD_DEGRADATION:
+            severe_failures.append("MAX_DD_WORSE")
+        if current_metrics["annualized_turnover"] > baseline_turnover + BASELINE_MAX_TURNOVER_INCREASE:
+            severe_failures.append("TURNOVER_HIGHER")
+
+        if all(item["passed"] for item in guardrails.values()):
+            status = "PASS"
+            summary = "Toutes les guardrails baseline sont respectees."
+        elif severe_failures:
+            status = "FAIL"
+            summary = ", ".join(severe_failures)
+        else:
+            status = "WATCH"
+            summary = "Iteration proche de la baseline mais hors zone d'acceptation."
+
+        return {
+            "status": status,
+            "summary": summary,
+            "guardrails": guardrails,
+            "severe_failures": severe_failures,
+        }
+
+
+    def _compare_with_baseline_reference(self) -> Optional[dict]:
+        baseline_path = Path("./baseline_event_driven_reference.json")
+        if not baseline_path.exists() or not self.final_metrics:
+            return None
+
+        try:
+            with baseline_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            logger.warning(f"  Impossible de lire la baseline de reference : {exc}")
+            return None
+
+        baseline_metrics = payload.get("metrics", {})
+        current_metrics = {
+            "cagr": float(self.final_metrics.get("cagr", 0.0)),
+            "sharpe": float(self.final_metrics.get("sharpe", 0.0)),
+            "max_drawdown": float(self.final_metrics.get("max_dd", 0.0)),
+            "calmar": float(self.final_metrics.get("calmar", 0.0)),
+            "trade_count": int(self.final_metrics.get("n_trades", 0)),
+            "annualized_turnover": float(self.final_metrics.get("avg_turnover", 0.0)),
+        }
+        delta = {
+            "cagr": current_metrics["cagr"] - float(baseline_metrics.get("cagr", 0.0)),
+            "sharpe": current_metrics["sharpe"] - float(baseline_metrics.get("sharpe", 0.0)),
+            "max_drawdown": current_metrics["max_drawdown"] - float(baseline_metrics.get("max_drawdown", 0.0)),
+            "calmar": current_metrics["calmar"] - float(baseline_metrics.get("calmar", 0.0)),
+            "trade_count": current_metrics["trade_count"] - int(baseline_metrics.get("trade_count", 0)),
+            "annualized_turnover": current_metrics["annualized_turnover"] - float(
+                baseline_metrics.get("annualized_turnover", 0.0)
+            ),
+        }
+        verdict = self._evaluate_baseline_verdict(
+            baseline_metrics=baseline_metrics,
+            current_metrics=current_metrics,
+            delta=delta,
+        )
+
+        logger.info("\n" + "=" * 60)
+        logger.info("  COMPARAISON BASELINE vs ITERATION")
+        logger.info("=" * 60)
+        logger.info(f"  {'Metrique':18s} {'Baseline':>12s} {'Iteration':>12s} {'Delta':>12s}")
+        logger.info(f"  {'-' * 58}")
+        logger.info(
+            f"  {'CAGR':18s} "
+            f"{float(baseline_metrics.get('cagr', 0.0)):>11.2%} "
+            f"{current_metrics['cagr']:>11.2%} "
+            f"{delta['cagr']:>+11.2%}"
+        )
+        logger.info(
+            f"  {'Sharpe':18s} "
+            f"{float(baseline_metrics.get('sharpe', 0.0)):>12.3f} "
+            f"{current_metrics['sharpe']:>12.3f} "
+            f"{delta['sharpe']:>+12.3f}"
+        )
+        logger.info(
+            f"  {'Max DD':18s} "
+            f"{float(baseline_metrics.get('max_drawdown', 0.0)):>11.2%} "
+            f"{current_metrics['max_drawdown']:>11.2%} "
+            f"{delta['max_drawdown']:>+11.2%}"
+        )
+        logger.info(
+            f"  {'Calmar':18s} "
+            f"{float(baseline_metrics.get('calmar', 0.0)):>12.3f} "
+            f"{current_metrics['calmar']:>12.3f} "
+            f"{delta['calmar']:>+12.3f}"
+        )
+        logger.info(
+            f"  {'Nb trades':18s} "
+            f"{int(baseline_metrics.get('trade_count', 0)):>12d} "
+            f"{current_metrics['trade_count']:>12d} "
+            f"{delta['trade_count']:>+12d}"
+        )
+        logger.info(
+            f"  {'Turnover/an':18s} "
+            f"{float(baseline_metrics.get('annualized_turnover', 0.0)):>11.1%} "
+            f"{current_metrics['annualized_turnover']:>11.1%} "
+            f"{delta['annualized_turnover']:>+11.1%}"
+        )
+        logger.info(
+            f"  {'Verdict':18s} {verdict['status']:>12s} {verdict['summary']}"
+        )
+
+        return {
+            "baseline_name": payload.get("name", "event_driven_baseline"),
+            "baseline_captured_on": payload.get("captured_on"),
+            "baseline_metrics": baseline_metrics,
+            "current_metrics": current_metrics,
+            "delta": delta,
+            "verdict": verdict,
+        }
 
 
 # ============================================================
@@ -865,7 +1468,7 @@ if __name__ == "__main__":
         data_path=args.data, start_date=args.start, end_date=args.end,
         initial_capital=INITIAL_CAPITAL, live_viz=args.live, output_dir=args.output,
     )
-
+    
     metrics = engine.run()
 
     print("\n  Génération de la visualisation 3D...")

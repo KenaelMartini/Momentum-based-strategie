@@ -53,6 +53,7 @@ from config import (
     LONG_QUANTILE,
     SHORT_QUANTILE,
 )
+from risk.rebalance import resolve_market_rebalance_threshold
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,10 +79,11 @@ class MarketRegime(Enum):
     STRESS → 0.50 : vol élevée ou corrélations qui montent
     CRISIS → 0.25 : stress systémique, protection maximale
     """
-    BULL   = 1.00
-    NORMAL = 0.75
-    STRESS = 0.50
-    CRISIS = 0.25
+    BULL      = 1.00
+    NORMAL    = 0.75
+    STRESS    = 0.50
+    CRISIS    = 0.25
+    SUSPENDED = 0.00
 
 
 @dataclass
@@ -134,6 +136,8 @@ class RiskSnapshot:
 
     # ── Circuit breaker global ───────────────────────────────
     trading_suspended : bool = False
+    suspension_reason : str = ""
+    suspended_days    : int = 0
     dd_max_stop       : bool = False   # alias pour compatibilité
 
     # ── Alertes texte ────────────────────────────────────────
@@ -175,6 +179,18 @@ class EventDrivenRiskManager:
         self.initial_capital = initial_capital
         self.peak_value      = initial_capital
 
+        # ── Hystérésis de régime (anti-thrashing) ──────────────
+        # Le régime risk (BULL/NORMAL/STRESS/CRISIS) peut osciller
+        # autour des frontières. On utilise une hystérésis :
+        # - quand le régime devient pire (valeur Enum plus basse) :
+        #   changement immédiat (protection tail risk).
+        # - quand le régime s'améliore : changement seulement après
+        #   N jours consécutifs.
+        self._risk_regime_current = MarketRegime.BULL
+        self._risk_regime_candidate = None
+        self._risk_regime_candidate_days = 0
+        self._risk_regime_up_days = 2
+
         # ── Buffers de volatilité du portefeuille ────────────
         # On stocke les rendements journaliers du portef. pour
         # calculer la vol rolling sans refaire tout l'historique.
@@ -210,6 +226,51 @@ class EventDrivenRiskManager:
             f"Max DD: {MAX_PORTFOLIO_DRAWDOWN:.0%} | "
             f"Target vol: {TARGET_VOLATILITY:.0%}"
         )
+
+    def _apply_regime_hysteresis(self, target_regime: MarketRegime) -> MarketRegime:
+        """
+        Applique une hystérésis simple sur la classification de régime.
+
+        Règles :
+        - Si le régime devient pire (valeur plus basse) : switch immédiat.
+        - Si le régime devient meilleur : switch après N jours consécutifs.
+        - Si le régime courant est SUSPENDED : switch immédiat (après cooldown).
+        """
+        current = getattr(self, "_risk_regime_current", target_regime)
+
+        # Après SUSPENDED on permet un retour plus rapide (cooldown gère déjà le timing).
+        if current == MarketRegime.SUSPENDED:
+            self._risk_regime_current = target_regime
+            self._risk_regime_candidate = None
+            self._risk_regime_candidate_days = 0
+            return target_regime
+
+        if target_regime == current:
+            self._risk_regime_candidate = None
+            self._risk_regime_candidate_days = 0
+            return current
+
+        # Régime "pire" = exposition multiplicateur plus faible.
+        if target_regime.value < current.value:
+            self._risk_regime_current = target_regime
+            self._risk_regime_candidate = None
+            self._risk_regime_candidate_days = 0
+            return target_regime
+
+        # Régime "meilleur" => dwell time.
+        if self._risk_regime_candidate != target_regime:
+            self._risk_regime_candidate = target_regime
+            self._risk_regime_candidate_days = 1
+        else:
+            self._risk_regime_candidate_days += 1
+
+        if self._risk_regime_candidate_days >= self._risk_regime_up_days:
+            self._risk_regime_current = target_regime
+            self._risk_regime_candidate = None
+            self._risk_regime_candidate_days = 0
+            return target_regime
+
+        return current
 
     # ─────────────────────────────────────────────────────────
     # MÉTHODE PRINCIPALE : update() — à appeler chaque jour
@@ -306,12 +367,17 @@ class EventDrivenRiskManager:
                 )
                 # On continue le calcul normal ci-dessous
             else:
+                snapshot.regime            = MarketRegime.SUSPENDED
+                snapshot.regime_score_raw  = 0.0
                 snapshot.trading_suspended = True
                 snapshot.dd_max_stop       = True
                 snapshot.risk_scaling      = 0.0
                 snapshot.regime_score      = 0.0
                 snapshot.current_drawdown  = current_drawdown
                 snapshot.peak_value        = self.peak_value
+                snapshot.suspension_reason = "COOLDOWN_ACTIVE"
+                snapshot.suspended_days    = int(days_suspended)
+                snapshot.alerts.append("TRADING_SUSPENDED")
                 return snapshot
 
         # ── Premier déclenchement du circuit breaker ──────────
@@ -319,12 +385,19 @@ class EventDrivenRiskManager:
         # Si DD dépasse le seuil → suspension immédiate + log unique.
         if current_drawdown < -MAX_PORTFOLIO_DRAWDOWN:
             self.trading_suspended = True
+            self._suspension_date = date
+            self._cash_at_exit = portfolio_value
+            snapshot.regime            = MarketRegime.SUSPENDED
+            snapshot.regime_score_raw  = 0.0
             snapshot.trading_suspended = True
             snapshot.dd_max_stop       = True
             snapshot.risk_scaling      = 0.0
             snapshot.regime_score      = 0.0
             snapshot.current_drawdown  = current_drawdown
             snapshot.peak_value        = self.peak_value
+            snapshot.suspension_reason = "MAX_DRAWDOWN_BREACH"
+            snapshot.suspended_days    = 0
+            snapshot.alerts.append("CIRCUIT_BREAKER_TRIGGERED")
             logger.critical(
                 f"🚨 {date.date()} | CIRCUIT BREAKER DÉCLENCHÉ | "
                 f"DD: {current_drawdown:.1%} > seuil -{MAX_PORTFOLIO_DRAWDOWN:.0%} | "
@@ -363,17 +436,25 @@ class EventDrivenRiskManager:
         dd_score = self._compute_dd_score(current_drawdown)
 
         # ── ÉTAPE 5 : Score composite + lissage ──────────────
-        # On prend le MINIMUM — le filtre le plus restrictif domine.
-        # Logique : si un seul indicateur crie au danger, on réduit.
+        # En crise, le filtre le plus restrictif doit dominer l'évaluation.
+        # Le lissage 3 jours (`self._regime_buffer`) évite les changements
+        # trop brutaux d'un jour à l'autre.
         regime_score_raw = min(trend_score, vol_score, corr_score, dd_score)
 
         # Lissage sur 3 jours : évite les changements brusques
         # qui génèrent du turnover inutile et des coûts de transaction
         self._regime_buffer.append(regime_score_raw)
-        regime_score = float(np.mean(self._regime_buffer))
+        regime_score_smoothed = float(np.mean(self._regime_buffer))
 
-        # Classification en régime discret
-        regime = self._classify_regime(regime_score)
+        # Contrôle "tail risk" : quand le drawdown devient dangereux,
+        # on veut que dd_score domine immédiatement.
+        # Sans cela, le lissage peut retarder le passage STRESS/CRISIS,
+        # et laisse passer des épisodes de MaxDD.
+        regime_score = float(min(regime_score_smoothed, dd_score))
+
+        # Classification en régime discret + hystérésis (anti-thrashing)
+        target_regime = self._classify_regime(regime_score)
+        regime = self._apply_regime_hysteresis(target_regime)
 
         # ── ÉTAPE 6 : Risk scaling final ──────────────────────
         # COMPOSANT 1 : Vol targeting
@@ -382,12 +463,12 @@ class EventDrivenRiskManager:
         vol_scaling = self._compute_vol_scaling(vol_short)
 
         # COMPOSANT 2 : Facteur régime
-        regime_factor = regime.value  # 1.0 / 0.75 / 0.50 / 0.25
-
-        # Scaling final = produit des deux composants, clippé
-        # Min 0.10 : on garde toujours 10% d'exposition (on ne sort jamais complètement)
-        # Max 1.50 : on ne dépasse pas 1.5x en période très calme
-        risk_scaling = float(np.clip(vol_scaling * regime_factor, 0.10, 1.50))
+        # La réduction d'exposition liée au régime est appliquée côté signal
+        # (event_driven.py) via `apply_regime_weight_filter`, pour éviter
+        # toute double pénalisation.
+        # Ici, on ne garde que le vol-targeting.
+        # Cap légèrement plus strict pour limiter le tail risk
+        risk_scaling = float(np.clip(vol_scaling, 0.10, 1.40))
 
         # ── ÉTAPE 7 : Stop-loss individuels ──────────────────
         positions_to_close = self._check_stop_losses(
@@ -601,9 +682,9 @@ class EventDrivenRiskManager:
           1. La stratégie ne fonctionne pas dans ce régime
           2. On protège le capital restant
 
-        SEUILS PROGRESSIFS (identiques à risk_enhanced.py) :
-          DD > 22% → score = 0.00 (circuit breaker total)
-          DD > 18% → score = 0.25 (réduction forte)
+        SEUILS PROGRESSIFS :
+          DD > 20% → score = 0.00 (circuit breaker total)
+          DD > 15.5% → score = 0.25 (réduction forte)
           DD > 12% → score = 0.50 (réduction modérée)
           DD > 8%  → score = 0.75 (réduction douce)
           DD ≤ 8%  → score = 1.00 (normal)
@@ -613,8 +694,8 @@ class EventDrivenRiskManager:
         """
         dd_abs = abs(current_drawdown)
 
-        if   dd_abs > 0.22: return 0.00
-        elif dd_abs > 0.18: return 0.25
+        if   dd_abs > 0.20: return 0.00
+        elif dd_abs > 0.155: return 0.25
         elif dd_abs > 0.12: return 0.50
         elif dd_abs > 0.08: return 0.75
         else:               return 1.00
@@ -653,15 +734,15 @@ class EventDrivenRiskManager:
         Si la vol réalisée est 0.5x la cible → scaling = 2.0
           → on augmenterait, mais on clippe à 1.5 max
 
-        CONTRAINTES [0.25, 1.50] :
+        CONTRAINTES [0.25, 1.40] :
           Min 0.25 : on garde toujours 25% d'exposition
-          Max 1.50 : on ne dépasse pas 1.5x en période très calme
+          Max 1.40 : on ne dépasse pas 1.40x en période très calme
         """
         if realized_vol < 0.001:
             return 1.0
 
         raw_scaling = TARGET_VOLATILITY / realized_vol
-        return float(np.clip(raw_scaling, 0.25, 1.50))
+        return float(np.clip(raw_scaling, 0.25, 1.40))
 
     # ─────────────────────────────────────────────────────────
     # STOP-LOSS INDIVIDUELS
@@ -780,6 +861,7 @@ class MomentumSignalGeneratorV2:
         # Utilisée par _filter_by_rebal_threshold pour éviter
         # de retrader des positions dont le signal n'a pas changé.
         self._prev_weights = {}
+        self.last_diagnostics = {}
 
         logger.info("MomentumSignalGeneratorV2 initialisé")
 
@@ -841,6 +923,7 @@ class MomentumSignalGeneratorV2:
         self,
         date          : pd.Timestamp,
         risk_snapshot : RiskSnapshot,
+        market_regime_state: str = "",
     ) -> dict:
         """
         Calcule les poids cibles du portefeuille pour la date t.
@@ -870,7 +953,44 @@ class MomentumSignalGeneratorV2:
             dict { symbol: poids } ou {} si pas de signal valide
         """
         # Si le trading est suspendu → aucune position
+        rebal_threshold, rebal_threshold_context = resolve_market_rebalance_threshold(
+            market_regime_state
+        )
+        # DD-aware rebalancing threshold (asymétrique) :
+        # - si dd_score est mauvais (drawdown dangereux) -> on baisse le threshold => on retrade
+        #   davantage pour désendetter/resserrer rapidement (meilleur contrôle du tail risk).
+        # - si dd_score est bon -> on conserve le threshold d'origine (sinon on peut perdre du Sharpe,
+        #   car on réduit trop le "churn" et on rate du rééquilibrage utile).
+        dd_score_for_rebal = float(getattr(risk_snapshot, "dd_score", 1.0) or 1.0)
+        dd_score_for_rebal = float(np.clip(dd_score_for_rebal, 0.0, 1.0))
+
+        # danger = 0 quand dd_score >= 0.6, danger = 1 quand dd_score <= 0.0
+        danger = float(np.clip((0.60 - dd_score_for_rebal) / 0.60, 0.0, 1.0))
+        # multiplier dans [0.75, 1.0] : only decrease threshold when danger > 0
+        dd_rebal_multiplier = float(1.0 - 0.25 * danger)
+        rebal_threshold_dd_aware = float(np.clip(rebal_threshold * dd_rebal_multiplier, 0.75 * rebal_threshold, rebal_threshold))
+        diagnostics = {
+            "date": date,
+            "signal_reason": "OK",
+            "risk_scaling": float(getattr(risk_snapshot, "risk_scaling", np.nan)),
+            "rebal_threshold": float(rebal_threshold),
+            "rebal_threshold_context": str(rebal_threshold_context),
+            "dd_score": dd_score_for_rebal,
+            "dd_rebal_multiplier": float(dd_rebal_multiplier),
+            "rebal_threshold_dd_aware": float(rebal_threshold_dd_aware),
+            "gross_signal_raw": 0.0,
+            "gross_after_constraints": 0.0,
+            "gross_after_risk_manager": 0.0,
+            "gross_after_rebal_threshold": 0.0,
+            "gross_after_signal_generator": 0.0,
+            "n_long_candidates": 0,
+            "n_short_candidates": 0,
+            "n_selected_positions": 0,
+        }
+
         if risk_snapshot.trading_suspended:
+            diagnostics["signal_reason"] = "TRADING_SUSPENDED"
+            self.last_diagnostics = diagnostics
             return {}
 
         # ── ÉTAPE 1 : Historique disponible jusqu'à t ─────────
@@ -882,6 +1002,8 @@ class MomentumSignalGeneratorV2:
         prices_hist = self.data.get_history(date, required)
 
         if len(prices_hist) < max(self.weights.keys()) + self.skip_days + 10:
+            diagnostics["signal_reason"] = "INSUFFICIENT_HISTORY"
+            self.last_diagnostics = diagnostics
             return {}
 
         # ── ÉTAPE 2 : Pipeline signal complète (identique au vectorisé) ──
@@ -893,6 +1015,8 @@ class MomentumSignalGeneratorV2:
             from strategies.momentum.momentum_signal import MomentumSignalGenerator
         except ImportError:
             logger.error("❌ Impossible d'importer MomentumSignalGenerator")
+            diagnostics["signal_reason"] = "IMPORT_ERROR"
+            self.last_diagnostics = diagnostics
             return {}
 
         # On désactive les logs du générateur pour ne pas polluer les logs
@@ -908,6 +1032,8 @@ class MomentumSignalGeneratorV2:
         except Exception as e:
             logging.disable(logging.NOTSET)
             logger.warning(f"  Signal generator échec : {e}")
+            diagnostics["signal_reason"] = "PIPELINE_ERROR"
+            self.last_diagnostics = diagnostics
             return {}
         finally:
             logging.disable(logging.NOTSET)
@@ -920,6 +1046,8 @@ class MomentumSignalGeneratorV2:
         ewma_vol     = sig_results["ewma_vol"]
 
         if signal_final.empty:
+            diagnostics["signal_reason"] = "EMPTY_SIGNAL"
+            self.last_diagnostics = diagnostics
             return {}
 
         signal_today = signal_final.iloc[-1].dropna()
@@ -938,6 +1066,8 @@ class MomentumSignalGeneratorV2:
         signal_sorted = signal_today.sort_values(ascending=False)
         top_longs  = signal_sorted.head(N_LONG)
         top_shorts = signal_sorted.tail(N_SHORT)
+        diagnostics["n_long_candidates"] = int(len(top_longs))
+        diagnostics["n_short_candidates"] = int(len(top_shorts))
 
         raw_weights = {}
 
@@ -958,17 +1088,22 @@ class MomentumSignalGeneratorV2:
             # Shorts à 50% — momentum short moins persistant
             raw_weights[symbol] = sig * (TARGET_VOLATILITY / vol) * 0.5
 
+        diagnostics["gross_signal_raw"] = float(sum(abs(w) for w in raw_weights.values()))
         if not raw_weights:
+            diagnostics["signal_reason"] = "NO_RAW_WEIGHTS"
+            self.last_diagnostics = diagnostics
             return {}
 
         # ── ÉTAPE 5 : Contraintes ─────────────────────────────
         weights_new = self._apply_constraints(raw_weights)
+        diagnostics["gross_after_constraints"] = float(sum(abs(w) for w in weights_new.values()))
 
         # ── ÉTAPE 6 : Application du risk scaling ─────────────
         # risk_scaling ∈ [0.10, 1.50] — calculé par EventDrivenRiskManager
         # Réduit l'exposition en régime STRESS/CRISIS ou vol élevée.
         scaling     = risk_snapshot.risk_scaling
         weights_new = {s: w * scaling for s, w in weights_new.items()}
+        diagnostics["gross_after_risk_manager"] = float(sum(abs(w) for w in weights_new.values()))
 
         # ── ÉTAPE 7 : Filtre de rebalancement ─────────────────
         # On ne retrade que les positions qui ont changé significativement
@@ -976,8 +1111,11 @@ class MomentumSignalGeneratorV2:
         weights = self._filter_by_rebal_threshold(
             new_weights  = weights_new,
             prev_weights = self._prev_weights,
-            threshold    = 0.015,
+            threshold    = rebal_threshold_dd_aware,
         )
+        diagnostics["rebal_threshold"] = float(rebal_threshold_dd_aware)
+        diagnostics["rebal_threshold_context"] = str(rebal_threshold_context)
+        diagnostics["gross_after_rebal_threshold"] = float(sum(abs(w) for w in weights.values()))
 
         # Mémoriser les poids pour le prochain rebalancement
         self._prev_weights = {s: w for s, w in weights.items() if abs(w) > 0.002}
@@ -989,6 +1127,10 @@ class MomentumSignalGeneratorV2:
                 self._prev_weights.pop(symbol, None)
                 logger.info(f"  Position {symbol} → 0 (stop-loss)")
 
+        diagnostics["gross_after_signal_generator"] = float(sum(abs(w) for w in weights.values()))
+        diagnostics["n_selected_positions"] = int(len(weights))
+        self.last_diagnostics = diagnostics
+
         # Log du snapshot du signal au rebalancement
         n_long  = sum(1 for w in weights.values() if w > 0.01)
         n_short = sum(1 for w in weights.values() if w < -0.01)
@@ -997,7 +1139,8 @@ class MomentumSignalGeneratorV2:
             f"  Signal {date.date()} | "
             f"L:{n_long} S:{n_short} | "
             f"Gross: {gross:.2f}x | "
-            f"Scaling: {scaling:.2f}x"
+            f"Scaling: {scaling:.2f}x | "
+            f"Rebal thr: {rebal_threshold:.3f}"
         )
 
         return weights

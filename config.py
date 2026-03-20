@@ -213,6 +213,31 @@ MAX_POSITION_LOSS = 0.15  # 15% de perte max par position
 # Très utilisée en CTA et trend following.
 TARGET_VOLATILITY = 0.15  # 15% de volatilité annualisée cible
 
+# OVERLAY DU REGIME DE MARCHE
+# Couche additionnelle pilotée par le moteur de regime "market".
+ENABLE_MARKET_OVERLAY = False
+MARKET_OVERLAY_MODE = "disabled"  # options: "disabled", "risk_off_only", "transition_and_risk_off"
+TRANSITION_OVERLAY_ENABLED = False
+RISK_OFF_MIN_SCALE = 0.15
+RISK_OFF_MAX_SCALE = 0.35
+
+# SEUILS DE REBALANCEMENT PAR REGIME DE MARCHE
+# Objectif court terme : réduire le turnover en RISK_ON sans toucher TREND.
+REBALANCE_THRESHOLD_DEFAULT = 0.032
+REBALANCE_THRESHOLD_BY_MARKET_REGIME = {
+    "TREND": REBALANCE_THRESHOLD_DEFAULT,
+    "RISK_ON": 0.042,
+    "TRANSITION": REBALANCE_THRESHOLD_DEFAULT,
+    "RISK_OFF": REBALANCE_THRESHOLD_DEFAULT,
+}
+
+# GARDE-FOUS D'ITERATION VS BASELINE
+# PASS si tous les checks sont satisfaits.
+BASELINE_MIN_ACCEPTED_SHARPE = 0.60
+BASELINE_MAX_CAGR_DEGRADATION = 0.0025
+BASELINE_MAX_MAX_DD_DEGRADATION = 0.0050
+BASELINE_MAX_TURNOVER_INCREASE = 0.25
+
 
 # ─────────────────────────────────────────────────────────────
 # SECTION 7 — DONNÉES HISTORIQUES

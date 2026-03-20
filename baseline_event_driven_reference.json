@@ -1,0 +1,13 @@
+{
+  "name": "event_driven_baseline",
+  "captured_on": "2026-03-19",
+  "source": "frozen after audit-only modular risk/regime refactor and baseline guardrail validation",
+  "metrics": {
+    "cagr": 0.12441414327117206,
+    "sharpe": 0.6225019340511717,
+    "max_drawdown": -0.15367884225525055,
+    "calmar": 0.8095723617212593,
+    "trade_count": 924,
+    "annualized_turnover": 12.211819509902735
+  }
+}
