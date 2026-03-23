@@ -8,14 +8,11 @@
 
 import sys
 import os
-import time
 import threading
 import logging
 import warnings
-from collections import deque
 
 import numpy as np
-import pandas as pd
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(
@@ -26,12 +23,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from event_driven import (
-    DataHandler, MomentumSignalGenerator,
-    Portfolio, SimulatedBroker, PortfolioStats,
-    DailyRiskManager, SignalEvent, Signal,
-)
-from config import INITIAL_CAPITAL, RISK_FREE_RATE, MAX_PORTFOLIO_DRAWDOWN
+from event_driven import EventDrivenEngine
+from config import INITIAL_CAPITAL, RISK_FREE_RATE
 
 
 # ============================================================
@@ -49,7 +42,6 @@ class SharedState:
     def add_stats(self, stats):
         with self.lock:
             self.stats.append(stats)
-            self.n_trades = len(self.stats)
 
     def get_stats_copy(self):
         with self.lock:
@@ -78,114 +70,29 @@ class BacktestThread(threading.Thread):
         self.speed_factor = speed_factor
 
     def run(self):
-        logger.info("  Thread backtest démarré...")
-        data_handler    = DataHandler(self.data_path, self.start_date, self.end_date)
-        signal_gen      = MomentumSignalGenerator(data_handler)
-        portfolio       = Portfolio(self.initial_cap)
-        broker          = SimulatedBroker()
-        day_count       = 0
-        n_trades        = 0
-        last_rebal_date = None
-        base_signal_weights = {}
-        regime_buffer   = deque(maxlen=3)
-        dd_max_triggered = False
-        risk_manager    = DailyRiskManager()
+        logger.info("  Thread backtest démarré (EventDrivenEngine)...")
 
-        while data_handler.has_data:
-            market_event = data_handler.get_next_bar()
-            if market_event is None:
-                break
-
-            date   = market_event.date
-            prices = market_event.prices
-
-            portfolio.update_prices(prices)
-
-            fills = broker.execute_pending(prices)
-            for fill in fills:
-                portfolio.fill_order(fill)
-                n_trades += 1
-
-            prices_hist = data_handler.get_history(date, 252)
-            portfolio_values = portfolio.get_portfolio_value_series(date)
-            risk_snapshot = risk_manager.compute_risk_snapshot(
-                date=date,
-                prices=prices_hist,
-                portfolio_values=portfolio_values,
-            )
-
-            if dd_max_triggered:
-                risk_snapshot.dd_score = 0.0
-                risk_snapshot.regime_score_raw = 0.0
-                risk_snapshot.regime_score = 0.0
-                risk_snapshot.dd_max_stop = True
-            else:
-                regime_buffer.append(risk_snapshot.regime_score_raw)
-                risk_snapshot.regime_score = float(np.mean(regime_buffer))
-                if risk_snapshot.dd_max_stop:
-                    risk_snapshot.regime_score_raw = 0.0
-                    risk_snapshot.regime_score = 0.0
-
-            regime_score = risk_snapshot.regime_score
-            turnover     = 0.0
-            emergency_exit = False
-
-            if risk_snapshot.dd_max_stop and not dd_max_triggered:
-                dd_max_triggered = True
-                base_signal_weights = {}
-                emergency_exit = True
-                logger.warning(
-                    f"  DD.MAX TRIGGER - {date.date()} | "
-                    f"DD courant: {risk_snapshot.drawdown:.2%} | "
-                    f"Seuil: -{MAX_PORTFOLIO_DRAWDOWN:.0%}"
-                )
-
-            rebal_today = (
-                not dd_max_triggered and (
-                    last_rebal_date is None or
-                    (date.year * 12 + date.month) >
-                    (last_rebal_date.year * 12 + last_rebal_date.month)
-                )
-            )
-
-            if rebal_today:
-                base_weights = signal_gen.compute_base_weights(date)
-                if base_weights is not None:
-                    base_signal_weights = base_weights
-                    last_rebal_date = date
-
-            target_weights = signal_gen.scale_weights(base_signal_weights, regime_score)
-            signal_event = SignalEvent(
-                date=date,
-                weights=target_weights,
-                regime=regime_score,
-                signal=Signal.FLAT if not target_weights else Signal.HOLD,
-            )
-            orders = portfolio.generate_orders(signal_event, prices)
-            if orders:
-                pv = portfolio.portfolio_value
-                if pv > 0:
-                    turnover = sum(abs(o.quantity * o.price) for o in orders) / pv
-                for order in orders:
-                    broker.submit_order(order)
-
-            stats = portfolio.compute_stats(
-                date=date,
-                regime_score=regime_score,
-                turnover=turnover,
-                emergency_exit=emergency_exit,
-                dd_score=risk_snapshot.dd_score,
-                dd_max_stop=risk_snapshot.dd_max_stop,
-            )
-
+        def on_day(stats, engine):
             self.shared.add_stats(stats)
-            day_count += 1
+            self.shared.n_trades = engine.n_trades
 
-            if self.speed_factor > 0:
-                time.sleep(self.speed_factor)
-
+        eng = EventDrivenEngine(
+            self.data_path,
+            start_date=self.start_date,
+            end_date=self.end_date,
+            initial_capital=self.initial_cap,
+            live_viz=False,
+            output_dir="./results/event_driven_live",
+            per_day_callback=on_day,
+            day_sleep_sec=self.speed_factor,
+        )
+        eng.run()
+        self.shared.n_trades = eng.n_trades
         self.shared.set_done()
-        logger.info(f"  Thread backtest terminé — {day_count} jours | {n_trades} trades")
+        logger.info(
+            f"  Thread backtest terminé — {len(self.shared.get_stats_copy())} jours | "
+            f"{eng.n_trades} trades"
+        )
 
 
 # ============================================================

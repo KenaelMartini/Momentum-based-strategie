@@ -201,7 +201,50 @@ RISK_FREE_RATE = 0.05  # 5% annualisé
 # STOP-LOSS au niveau du portefeuille
 # Si le portefeuille perd plus de X% depuis son dernier sommet
 # (drawdown), on arrête de trader et on sort toutes les positions.
-MAX_PORTFOLIO_DRAWDOWN = 0.15  # 15% de drawdown maximum
+# Profil aligné sur le run figé stats_20260323_190605 (identique à 191330 sur la courbe) :
+# pas de snapshot git — reconstitué depuis les raisons de suspension dans ce CSV.
+MAX_PORTFOLIO_DRAWDOWN = 0.15  # 15% — inchangé vs commit initial ; évite coupes « pic risk reset » trop tôt
+
+# Réentrée après circuit breaker
+SUSPENSION_COOLDOWN_CALENDAR_DAYS = 12
+SUSPENSION_REENTRY_DD_FROM_EXIT = -0.05
+SUSPENSION_REENTRY_FAST_CALENDAR_DAYS = 7
+SUSPENSION_REENTRY_FAST_DD_FROM_EXIT = -0.015
+SUSPENSION_REENTRY_REQUIRE_REGIME_CONFIRMATION = True
+SUSPENSION_REENTRY_ALLOWED_RISK_REGIMES = ("BULL", "NORMAL")
+SUSPENSION_REENTRY_MIN_CONSECUTIVE_RISK_DAYS = 3
+SUSPENSION_REENTRY_RAMP_ENABLED = True
+SUSPENSION_REENTRY_RAMP_SCALES = (0.35, 0.55, 0.75, 1.0)
+# Désactivé sur 190605 : aucune suspension_reason POST_REENTRY_RECUT_* dans ce run.
+SUSPENSION_POST_REENTRY_RECUT_ENABLED = False
+SUSPENSION_POST_REENTRY_RECUT_SESSION_DAYS = 5
+SUSPENSION_POST_REENTRY_RECUT_LOSS = 0.015
+SUSPENSION_POST_REENTRY_RECUT_MAX_CALENDAR_WAIT_NO_INVEST = 45
+# False sur le run de référence (défaut moteur risk) ; True modifie dates de fill / recut.
+REBALANCE_FILL_SAME_BAR = False
+# Désactivé sur 190605 : aucune REBALANCE_WINDOW_LOSS_CUT dans ce run.
+REBALANCE_WINDOW_LOSS_CUT_ENABLED = False
+REBALANCE_WINDOW_LOSS_CUT_SESSION_DAYS = 5
+REBALANCE_WINDOW_LOSS_CUT_LOSS = 0.02
+FAST_DRAWDOWN_CUT_ENABLED = True
+FAST_DRAWDOWN_CUT_THRESHOLD = 0.065
+FAST_DRAWDOWN_CUT_WINDOW_DAYS = 7
+FAST_DRAWDOWN_CUT_WINDOW_DAYS_RISK_OFF = 7
+# Horizon lent additionnel (dégradation progressive en stress/crise)
+FAST_DRAWDOWN_CUT_THRESHOLD_LONG = 0.055
+FAST_DRAWDOWN_CUT_WINDOW_DAYS_LONG = 10
+# Confirmation anti-bruit : N jours consécutifs de breach avant suspension
+FAST_DRAWDOWN_CUT_CONFIRM_DAYS = 2
+# Profil C : pas de fast cut **court** en BULL/NORMAL (évite sorties type oct. 2021) ;
+# l’horizon **long** reste actif dans tous les régimes (grind lent même si le risk est encore optimiste).
+FAST_DRAWDOWN_CUT_ONLY_UNDER_STRESS = True
+
+# Sous le pic global : si plus de N jours consécutifs en DD<0 ET DD <= seuil,
+# on multiplie risk_scaling (réduction d’expo sans tout liquider).
+PROLONGED_UNDERWATER_ENABLED = True
+PROLONGED_UNDERWATER_MIN_DAYS = 12
+PROLONGED_UNDERWATER_MIN_DD = -0.09
+PROLONGED_UNDERWATER_RISK_SCALE_MULT = 0.92
 
 # STOP-LOSS au niveau d'une position individuelle
 # Si une position perd plus de X%, on la ferme immédiatement.
@@ -221,15 +264,61 @@ TRANSITION_OVERLAY_ENABLED = False
 RISK_OFF_MIN_SCALE = 0.15
 RISK_OFF_MAX_SCALE = 0.35
 
-# SEUILS DE REBALANCEMENT PAR REGIME DE MARCHE
-# Objectif court terme : réduire le turnover en RISK_ON sans toucher TREND.
+# Seuil relatif min. sur |Δw| pour déclencher un trade au rebalancement mensuel.
 REBALANCE_THRESHOLD_DEFAULT = 0.032
-REBALANCE_THRESHOLD_BY_MARKET_REGIME = {
-    "TREND": REBALANCE_THRESHOLD_DEFAULT,
-    "RISK_ON": 0.042,
-    "TRANSITION": REBALANCE_THRESHOLD_DEFAULT,
-    "RISK_OFF": REBALANCE_THRESHOLD_DEFAULT,
-}
+
+# Rééquilibrage robuste en phase défensive
+# - En RISK_OFF: uniquement réduction de risque (pas d'augmentation d'exposition)
+RISK_OFF_ONLY_DERISK_ENABLED = True
+# Si un actif passe de long à short (ou inverse), on force l'exécution même si |Δw| < seuil.
+REBALANCE_FORCE_SIGN_FLIP_EXECUTION = True
+
+# Cible d'exposition nette (Σw) par régime de marché effectif.
+# Permet d'éviter une dérive structurelle trop décorrélée en conservant la protection.
+REGIME_NET_EXPOSURE_TARGET_ENABLED = True
+REGIME_NET_TARGET_RISK_OFF_MIN = 0.0
+REGIME_NET_TARGET_RISK_OFF_MAX = 0.15
+REGIME_NET_TARGET_TRANSITION_MIN = 0.0
+REGIME_NET_TARGET_TRANSITION_MAX = 0.40
+REGIME_NET_TARGET_TREND_MIN = -1.0
+REGIME_NET_TARGET_TREND_MAX = 1.0
+REGIME_NET_TARGET_RISK_ON_MIN = -1.0
+REGIME_NET_TARGET_RISK_ON_MAX = 1.0
+
+# --- Régime marché (features) aligné sur BULL / STRESS / CRISIS (risk manager) ---
+# Quand True, l’état utilisé pour les stats / perf par régime et les tilts ci-dessous
+# combine le classifieur “macro” et le régime risque discret (plus de RISK_OFF crédible).
+ALIGN_MARKET_REGIME_WITH_RISK = True
+
+# Multiplicateur sur les poids après apply_regime_weight_filter, selon régime aligné.
+# Activé : réduit fortement l’expo en RISK_OFF (aligné), où les stats montrent souvent
+# beaucoup d’épisodes DD longs et un Sharpe faible.
+# True + scale bas (0.45–0.65) = forte coupe en RISK_OFF aligné ; sur ce backtest le Max DD global peut empirer (path-dependent).
+RISK_INFORMED_EXPOSURE_TILT_ENABLED = False
+RISK_INFORMED_SCALE_RISK_OFF = 0.55
+RISK_INFORMED_SCALE_TRANSITION_UNDER_STRESS = 0.90
+# TREND riche en alpha : filet léger quand le risk voit déjà du STRESS.
+RISK_INFORMED_SCALE_TREND_UNDER_STRESS = 0.95
+
+# En phase TREND (régime aligné = TREND) : paliers DD portfolio supplémentaires + reprise.
+TREND_DRAWDOWN_TILT_ENABLED = False
+TREND_DD_MULT_LE5PCT = 0.97
+TREND_DD_MULT_LE8PCT = 0.92
+TREND_DD_MULT_LE12PCT = 0.84
+TREND_RECOVERY_MULT = 1.05
+TREND_RECOVERY_MAX_DD_FOR_BOOST = -0.008
+TREND_RECOVERY_MIN_REGIME_SCORE = 0.82
+
+# --- Flat défensif + réentrée par régime (hors circuit breaker DD max) ---
+DEFENSIVE_FLAT_ENABLED = False
+DEFENSIVE_FLAT_ENTRY_EFFECTIVE_REGIMES = ("RISK_OFF",)
+DEFENSIVE_FLAT_ENTRY_MIN_DD = -0.055
+DEFENSIVE_FLAT_ENTRY_MIN_CONSECUTIVE_DAYS = 4
+DEFENSIVE_FLAT_MIN_CALENDAR_DAYS = 3
+DEFENSIVE_FLAT_REENTRY_EFFECTIVE_REGIMES = ("TREND", "RISK_ON")
+DEFENSIVE_FLAT_REENTRY_EFFECTIVE_CONSECUTIVE = 2
+DEFENSIVE_FLAT_REENTRY_RISK_REGIMES = ("BULL", "NORMAL")
+DEFENSIVE_FLAT_REENTRY_RISK_CONSECUTIVE = 2
 
 # GARDE-FOUS D'ITERATION VS BASELINE
 # PASS si tous les checks sont satisfaits.

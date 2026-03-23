@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Optional
 
 import numpy as np
@@ -196,13 +197,73 @@ def build_regime_log_frame(
     return regime_log
 
 
+def _count_contiguous_runs_strictly_longer_than(mask: pd.Series, min_length: int) -> int:
+    """Compte les plages consécutives de True de longueur strictement supérieure à min_length."""
+    m = mask.fillna(False).to_numpy(dtype=bool)
+    if m.size == 0:
+        return 0
+    total = 0
+    run = 0
+    for b in m:
+        if b:
+            run += 1
+        else:
+            if run > min_length:
+                total += 1
+            run = 0
+    if run > min_length:
+        total += 1
+    return int(total)
+
+
+def regime_streak_episode_counts(
+    frame: pd.DataFrame,
+    regime_col: str = "market_regime_state",
+    drawdown_col: str = "drawdown",
+    returns_col: str = "daily_return",
+    dd_episode_gt_days: int = 10,
+    growth_episode_gt_days: int = 5,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """
+    Par segment calendaire contigu où le régime est constant :
+    - épisodes « en drawdown » : jours consécutifs avec drawdown < 0 (sous le pic global),
+      longueur > dd_episode_gt_days ;
+    - épisodes de croissance : jours consécutifs avec daily_return > 0, longueur > growth_episode_gt_days.
+    """
+    dd_eps: dict[str, int] = defaultdict(int)
+    gr_eps: dict[str, int] = defaultdict(int)
+    need = [regime_col, drawdown_col, returns_col]
+    for c in need:
+        if c not in frame.columns:
+            return {}, {}
+    cols = list(need)
+    if "date" in frame.columns:
+        cols = ["date"] + cols
+    work = frame.loc[frame[regime_col].notna(), cols].copy()
+    if work.empty:
+        return {}, {}
+    if "date" in work.columns:
+        work = work.sort_values("date")
+    work["_streak"] = (work[regime_col] != work[regime_col].shift()).cumsum()
+    for _, streak_df in work.groupby("_streak", sort=False):
+        r = str(streak_df[regime_col].iloc[0])
+        underwater = streak_df[drawdown_col].astype(float) < 0.0
+        up = streak_df[returns_col].astype(float) > 0.0
+        dd_eps[r] += _count_contiguous_runs_strictly_longer_than(underwater, dd_episode_gt_days)
+        gr_eps[r] += _count_contiguous_runs_strictly_longer_than(up, growth_episode_gt_days)
+    return dict(dd_eps), dict(gr_eps)
+
+
 def summarize_regime_performance(
     frame: pd.DataFrame,
     regime_col: str = "market_regime_state",
     score_col: str = "market_regime_score",
     returns_col: str = "daily_return",
     turnover_col: str = "turnover",
+    drawdown_col: str = "drawdown",
     risk_free_rate: float = 0.0,
+    dd_episode_gt_days: int = 10,
+    growth_episode_gt_days: int = 5,
 ) -> pd.DataFrame:
     if frame is None or frame.empty or regime_col not in frame.columns or returns_col not in frame.columns:
         return pd.DataFrame()
@@ -210,6 +271,25 @@ def summarize_regime_performance(
     working = frame.loc[frame[regime_col].notna()].copy()
     if working.empty:
         return pd.DataFrame()
+    non_empty = working[regime_col].astype(str).str.strip().str.len() > 0
+    working = working.loc[non_empty].copy()
+    if working.empty:
+        return pd.DataFrame()
+
+    dd_eps, gr_eps = ({}, {})
+    mean_dd_by_regime: pd.Series | None = None
+    worst_dd_by_regime: pd.Series | None = None
+    if drawdown_col in working.columns:
+        dd_eps, gr_eps = regime_streak_episode_counts(
+            working,
+            regime_col=regime_col,
+            drawdown_col=drawdown_col,
+            returns_col=returns_col,
+            dd_episode_gt_days=dd_episode_gt_days,
+            growth_episode_gt_days=growth_episode_gt_days,
+        )
+        mean_dd_by_regime = working.groupby(regime_col)[drawdown_col].mean()
+        worst_dd_by_regime = working.groupby(regime_col)[drawdown_col].min()
 
     rf_daily = (1.0 + risk_free_rate) ** (1 / 252) - 1
     total_days = len(working)
@@ -246,22 +326,30 @@ def summarize_regime_performance(
         else:
             calmar = float("nan")
 
-        rows.append(
-            {
-                "regime_state": regime_state,
-                "days": int(days),
-                "pct_time": float(days / total_days),
-                "total_return": total_return,
-                "annualized_return": annualized_return,
-                "annualized_vol": annualized_vol,
-                "sharpe": sharpe,
-                "max_drawdown": max_drawdown,
-                "calmar": calmar,
-                "hit_rate": float((returns > 0).mean()),
-                "avg_turnover": float(group[turnover_col].mean()) if turnover_col in group.columns else float("nan"),
-                "avg_regime_score": float(group[score_col].mean()) if score_col in group.columns else float("nan"),
-            }
-        )
+        rs = str(regime_state)
+        row = {
+            "regime_state": regime_state,
+            "days": int(days),
+            "pct_time": float(days / total_days),
+            "total_return": total_return,
+            "annualized_return": annualized_return,
+            "annualized_vol": annualized_vol,
+            "sharpe": sharpe,
+            "max_drawdown": max_drawdown,
+            "calmar": calmar,
+            "hit_rate": float((returns > 0).mean()),
+            "avg_turnover": float(group[turnover_col].mean()) if turnover_col in group.columns else float("nan"),
+            "avg_regime_score": float(group[score_col].mean()) if score_col in group.columns else float("nan"),
+            "mean_portfolio_drawdown": float(mean_dd_by_regime.loc[regime_state])
+            if mean_dd_by_regime is not None and regime_state in mean_dd_by_regime.index
+            else float("nan"),
+            "worst_portfolio_drawdown": float(worst_dd_by_regime.loc[regime_state])
+            if worst_dd_by_regime is not None and regime_state in worst_dd_by_regime.index
+            else float("nan"),
+            "n_dd_episodes_gt_10d": int(dd_eps.get(rs, 0)),
+            "n_growth_episodes_gt_5d": int(gr_eps.get(rs, 0)),
+        }
+        rows.append(row)
 
     summary = pd.DataFrame(rows)
     if summary.empty:

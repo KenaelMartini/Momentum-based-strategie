@@ -2,7 +2,7 @@
 # event_driven_risk.py — Système de Risque Event-Driven Complet
 # ============================================================
 # RÔLE DE CE FICHIER :
-# Remplacer le système de risque simplifié de event_driven.py
+# Intégré au package event_driven (engine) — remplace l’ancien risk simplifié.
 # par le système complet équivalent à risk_manager.py +
 # risk_enhanced.py, adapté à la boucle event-driven.
 #
@@ -38,6 +38,7 @@ import pandas as pd
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import config as _cfg
 from config import (
     INITIAL_CAPITAL,
     MAX_PORTFOLIO_DRAWDOWN,  # 0.20 — circuit breaker global
@@ -52,8 +53,64 @@ from config import (
     SKIP_DAYS,
     LONG_QUANTILE,
     SHORT_QUANTILE,
+    REBALANCE_THRESHOLD_DEFAULT,
+    PROLONGED_UNDERWATER_ENABLED,
+    PROLONGED_UNDERWATER_MIN_DAYS,
+    PROLONGED_UNDERWATER_MIN_DD,
+    PROLONGED_UNDERWATER_RISK_SCALE_MULT,
+    SUSPENSION_COOLDOWN_CALENDAR_DAYS,
+    SUSPENSION_REENTRY_DD_FROM_EXIT,
+    SUSPENSION_REENTRY_FAST_CALENDAR_DAYS,
+    SUSPENSION_REENTRY_FAST_DD_FROM_EXIT,
 )
-from risk.rebalance import resolve_market_rebalance_threshold
+
+# Optionnels (non présents dans config.py = comportement historique inchangé)
+SUSPENSION_REENTRY_REQUIRE_REGIME_CONFIRMATION = getattr(_cfg, "SUSPENSION_REENTRY_REQUIRE_REGIME_CONFIRMATION", False)
+SUSPENSION_REENTRY_ALLOWED_RISK_REGIMES = getattr(_cfg, "SUSPENSION_REENTRY_ALLOWED_RISK_REGIMES", ("BULL", "NORMAL"))
+SUSPENSION_REENTRY_MIN_CONSECUTIVE_RISK_DAYS = getattr(_cfg, "SUSPENSION_REENTRY_MIN_CONSECUTIVE_RISK_DAYS", 2)
+SUSPENSION_REENTRY_RAMP_ENABLED = getattr(_cfg, "SUSPENSION_REENTRY_RAMP_ENABLED", False)
+SUSPENSION_REENTRY_RAMP_SCALES = getattr(_cfg, "SUSPENSION_REENTRY_RAMP_SCALES", (0.30, 0.60, 1.00))
+SUSPENSION_POST_REENTRY_GUARD_ENABLED = getattr(_cfg, "SUSPENSION_POST_REENTRY_GUARD_ENABLED", False)
+SUSPENSION_POST_REENTRY_GUARD_CALENDAR_DAYS = getattr(_cfg, "SUSPENSION_POST_REENTRY_GUARD_CALENDAR_DAYS", 5)
+SUSPENSION_POST_REENTRY_GUARD_DD = getattr(_cfg, "SUSPENSION_POST_REENTRY_GUARD_DD", -0.02)
+SUSPENSION_POST_REENTRY_RECUT_ENABLED = getattr(_cfg, "SUSPENSION_POST_REENTRY_RECUT_ENABLED", False)
+# Nombre de **séances** (appels update / jours de bourse dans le backtest), pas jours calendaires
+# (sinon ven. → lun. saute la fenêtre alors qu’une seule séance a passé — typique début janvier).
+SUSPENSION_POST_REENTRY_RECUT_SESSION_DAYS = getattr(
+    _cfg,
+    "SUSPENSION_POST_REENTRY_RECUT_SESSION_DAYS",
+    getattr(_cfg, "SUSPENSION_POST_REENTRY_RECUT_CALENDAR_DAYS", 5),
+)
+SUSPENSION_POST_REENTRY_RECUT_LOSS = getattr(_cfg, "SUSPENSION_POST_REENTRY_RECUT_LOSS", 0.02)
+# Si toujours pas de positions après réentrée (attente rebalance mensuel), abandonner le suivi recut.
+SUSPENSION_POST_REENTRY_RECUT_MAX_CALENDAR_WAIT_NO_INVEST = getattr(
+    _cfg, "SUSPENSION_POST_REENTRY_RECUT_MAX_CALENDAR_WAIT_NO_INVEST", 45
+)
+REBALANCE_FILL_SAME_BAR = getattr(_cfg, "REBALANCE_FILL_SAME_BAR", False)
+REBALANCE_WINDOW_LOSS_CUT_ENABLED = getattr(_cfg, "REBALANCE_WINDOW_LOSS_CUT_ENABLED", False)
+REBALANCE_WINDOW_LOSS_CUT_SESSION_DAYS = getattr(_cfg, "REBALANCE_WINDOW_LOSS_CUT_SESSION_DAYS", 5)
+REBALANCE_WINDOW_LOSS_CUT_LOSS = getattr(_cfg, "REBALANCE_WINDOW_LOSS_CUT_LOSS", 0.02)
+FAST_DRAWDOWN_CUT_ENABLED = getattr(_cfg, "FAST_DRAWDOWN_CUT_ENABLED", False)
+FAST_DRAWDOWN_CUT_THRESHOLD = getattr(_cfg, "FAST_DRAWDOWN_CUT_THRESHOLD", 0.05)
+FAST_DRAWDOWN_CUT_WINDOW_DAYS = getattr(_cfg, "FAST_DRAWDOWN_CUT_WINDOW_DAYS", 7)
+FAST_DRAWDOWN_CUT_WINDOW_DAYS_RISK_OFF = getattr(_cfg, "FAST_DRAWDOWN_CUT_WINDOW_DAYS_RISK_OFF", 5)
+# Profil C : n'évalue le fast cut que si le régime risk discret est déjà STRESS/CRISIS
+# (état hystérétique en fin de jour précédent — pas BULL/NORMAL).
+FAST_DRAWDOWN_CUT_ONLY_UNDER_STRESS = getattr(_cfg, "FAST_DRAWDOWN_CUT_ONLY_UNDER_STRESS", False)
+FAST_DRAWDOWN_CUT_THRESHOLD_LONG = getattr(_cfg, "FAST_DRAWDOWN_CUT_THRESHOLD_LONG", 0.07)
+FAST_DRAWDOWN_CUT_WINDOW_DAYS_LONG = getattr(_cfg, "FAST_DRAWDOWN_CUT_WINDOW_DAYS_LONG", 10)
+FAST_DRAWDOWN_CUT_CONFIRM_DAYS = getattr(_cfg, "FAST_DRAWDOWN_CUT_CONFIRM_DAYS", 2)
+RISK_OFF_ONLY_DERISK_ENABLED = getattr(_cfg, "RISK_OFF_ONLY_DERISK_ENABLED", True)
+REBALANCE_FORCE_SIGN_FLIP_EXECUTION = getattr(_cfg, "REBALANCE_FORCE_SIGN_FLIP_EXECUTION", True)
+REGIME_NET_EXPOSURE_TARGET_ENABLED = getattr(_cfg, "REGIME_NET_EXPOSURE_TARGET_ENABLED", True)
+REGIME_NET_TARGET_RISK_OFF_MIN = getattr(_cfg, "REGIME_NET_TARGET_RISK_OFF_MIN", 0.0)
+REGIME_NET_TARGET_RISK_OFF_MAX = getattr(_cfg, "REGIME_NET_TARGET_RISK_OFF_MAX", 0.15)
+REGIME_NET_TARGET_TRANSITION_MIN = getattr(_cfg, "REGIME_NET_TARGET_TRANSITION_MIN", 0.0)
+REGIME_NET_TARGET_TRANSITION_MAX = getattr(_cfg, "REGIME_NET_TARGET_TRANSITION_MAX", 0.40)
+REGIME_NET_TARGET_TREND_MIN = getattr(_cfg, "REGIME_NET_TARGET_TREND_MIN", -1.0)
+REGIME_NET_TARGET_TREND_MAX = getattr(_cfg, "REGIME_NET_TARGET_TREND_MAX", 1.0)
+REGIME_NET_TARGET_RISK_ON_MIN = getattr(_cfg, "REGIME_NET_TARGET_RISK_ON_MIN", -1.0)
+REGIME_NET_TARGET_RISK_ON_MAX = getattr(_cfg, "REGIME_NET_TARGET_RISK_ON_MAX", 1.0)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,6 +200,9 @@ class RiskSnapshot:
     # ── Alertes texte ────────────────────────────────────────
     alerts : list = field(default_factory=list)
 
+    # ── Sous l'eau prolongé (streak DD<0 + magnitude) ────────
+    prolonged_underwater_active: bool = False
+
 
 # ============================================================
 # SECTION 2 — GESTIONNAIRE DE RISQUE EVENT-DRIVEN
@@ -220,6 +280,11 @@ class EventDrivenRiskManager:
         # ── Compteur de jours de stress ─────────────────────
         self._stress_days = 0
 
+        # ── Jours consécutifs avec drawdown < 0 (sous le pic) ─
+        self._underwater_streak = 0
+        self._reentry_regime_ok_days = 0
+        self._fast_dd_breach_streak = 0
+
         logger.info(
             f"EventDrivenRiskManager initialisé | "
             f"Capital: {initial_capital:,.0f}$ | "
@@ -271,6 +336,235 @@ class EventDrivenRiskManager:
             return target_regime
 
         return current
+
+    def _disarm_rebalance_window_loss_cut(self) -> None:
+        for name in (
+            "_rbw_anchor",
+            "_rbw_sessions",
+            "_rbw_worst",
+            "_rbw_last_eval_session_date",
+            "_rbw_anchor_month",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
+
+    def _arm_rebalance_window_loss_cut(self, date: pd.Timestamp, portfolio_value: float) -> None:
+        if not REBALANCE_WINDOW_LOSS_CUT_ENABLED:
+            return
+        self._rbw_anchor = float(portfolio_value)
+        self._rbw_sessions = 0
+        self._rbw_worst = 0.0
+        self._rbw_anchor_month = (int(date.year), int(date.month))
+        if hasattr(self, "_rbw_last_eval_session_date"):
+            del self._rbw_last_eval_session_date
+
+    def _snapshot_suspend_post_reentry(
+        self,
+        date: pd.Timestamp,
+        portfolio_value: float,
+        reason: str,
+        alert: str,
+        log_message: str,
+    ) -> RiskSnapshot:
+        if portfolio_value > self.peak_value:
+            self.peak_value = portfolio_value
+        current_drawdown = (portfolio_value - self.peak_value) / (self.peak_value + 1e-8)
+        self.trading_suspended = True
+        self._underwater_streak = 0
+        self._fast_dd_breach_streak = 0
+        self._suspension_date = date
+        self._cash_at_exit = portfolio_value
+        self._reentry_regime_ok_days = 0
+        self._disarm_rebalance_window_loss_cut()
+        snapshot = RiskSnapshot(date=date)
+        snapshot.regime = MarketRegime.SUSPENDED
+        snapshot.regime_score_raw = 0.0
+        snapshot.trading_suspended = True
+        snapshot.dd_max_stop = True
+        snapshot.risk_scaling = 0.0
+        snapshot.regime_score = 0.0
+        snapshot.current_drawdown = current_drawdown
+        snapshot.peak_value = self.peak_value
+        snapshot.suspension_reason = reason
+        snapshot.suspended_days = 0
+        snapshot.alerts.append(alert)
+        logger.critical(log_message)
+        return snapshot
+
+    def _eval_post_reentry_recut(
+        self,
+        date: pd.Timestamp,
+        portfolio_value: float,
+        current_positions: dict,
+        *,
+        same_bar_rebalance_followup: bool = False,
+    ):
+        """
+        Évalue le recut post-réentrée (ancre = 1re séance investie, pire clôture vs ancre sur la fenêtre).
+        Retourne un RiskSnapshot si suspension, sinon None.
+        """
+        if not SUSPENSION_POST_REENTRY_RECUT_ENABLED:
+            return None
+        if self.trading_suspended or not hasattr(self, "_reentry_date"):
+            return None
+        invested = bool(current_positions) and any(
+            abs(float(q)) > 1e-9 for q in current_positions.values()
+        )
+        if not invested:
+            return None
+        recut_n = int(max(1, SUSPENSION_POST_REENTRY_RECUT_SESSION_DAYS))
+        thr = float(SUSPENSION_POST_REENTRY_RECUT_LOSS)
+
+        # Même jour : le matin update() a déjà incrémenté la séance avec l’ancien book ;
+        # après fill rebalance même bar, on ne refait qu’actualiser le pire vs ancre (pas sess+1).
+        if same_bar_rebalance_followup and getattr(self, "_reentry_last_eval_session_date", None) == date:
+            anchor_v = getattr(self, "_reentry_anchor_value", None)
+            if anchor_v is not None:
+                anchor = float(anchor_v)
+                r = float(portfolio_value) / anchor - 1.0 if anchor > 0 else 0.0
+                self._reentry_worst_vs_anchor = min(
+                    float(getattr(self, "_reentry_worst_vs_anchor", 0.0)), r
+                )
+                w = float(self._reentry_worst_vs_anchor)
+                sess = int(getattr(self, "_reentry_sessions_since", 0))
+                if anchor > 0 and 1 <= sess <= recut_n and w <= -thr:
+                    return self._snapshot_suspend_post_reentry(
+                        date,
+                        portfolio_value,
+                        "POST_REENTRY_RECUT_LOSS",
+                        "POST_REENTRY_RECUT_TRIGGERED",
+                        (
+                            f"🚨 {date.date()} | POST-REENTRY RECUT | "
+                            f"Pire clôture vs ancre: {w:.1%} <= -{thr:.1%} "
+                            f"(séance investie {sess}/{recut_n}, post-rebal) | "
+                            f"Trading SUSPENDU — toutes les positions liquidées en cash"
+                        ),
+                    )
+            return None
+
+        if getattr(self, "_reentry_anchor_value", None) is None:
+            self._reentry_anchor_value = float(portfolio_value)
+            self._reentry_sessions_since = 0
+            self._reentry_worst_vs_anchor = 0.0
+        self._reentry_sessions_since = int(getattr(self, "_reentry_sessions_since", 0)) + 1
+        sess = int(self._reentry_sessions_since)
+        anchor = float(self._reentry_anchor_value)
+        r = float(portfolio_value) / anchor - 1.0 if anchor > 0 else 0.0
+        self._reentry_worst_vs_anchor = min(float(getattr(self, "_reentry_worst_vs_anchor", 0.0)), r)
+        w = float(self._reentry_worst_vs_anchor)
+        self._reentry_last_eval_session_date = date
+        if anchor > 0 and 1 <= sess <= recut_n and w <= -thr:
+            return self._snapshot_suspend_post_reentry(
+                date,
+                portfolio_value,
+                "POST_REENTRY_RECUT_LOSS",
+                "POST_REENTRY_RECUT_TRIGGERED",
+                (
+                    f"🚨 {date.date()} | POST-REENTRY RECUT | "
+                    f"Pire clôture vs ancre: {w:.1%} <= -{thr:.1%} "
+                    f"(séance investie {sess}/{recut_n}) | "
+                    f"Trading SUSPENDU — toutes les positions liquidées en cash"
+                ),
+            )
+        return None
+
+    def _eval_rebalance_window_loss_cut(
+        self,
+        date: pd.Timestamp,
+        portfolio_value: float,
+        current_positions: dict,
+        *,
+        same_bar_rebalance_followup: bool = False,
+    ):
+        """
+        Fenêtre de perte après **chaque** rebalance mensuel (ancre = PV post-fill).
+        Indépendant d'une suspension / réentrée risk.
+        """
+        if not REBALANCE_WINDOW_LOSS_CUT_ENABLED:
+            return None
+        if self.trading_suspended or not hasattr(self, "_rbw_anchor"):
+            return None
+        am = getattr(self, "_rbw_anchor_month", None)
+        if am is not None:
+            ym = (int(date.year), int(date.month))
+            if ym > am:
+                self._disarm_rebalance_window_loss_cut()
+                return None
+        invested = bool(current_positions) and any(
+            abs(float(q)) > 1e-9 for q in current_positions.values()
+        )
+        if not invested:
+            return None
+        n = int(max(1, REBALANCE_WINDOW_LOSS_CUT_SESSION_DAYS))
+        thr = float(REBALANCE_WINDOW_LOSS_CUT_LOSS)
+        anchor = float(self._rbw_anchor)
+
+        if same_bar_rebalance_followup and getattr(self, "_rbw_last_eval_session_date", None) == date:
+            r = float(portfolio_value) / anchor - 1.0 if anchor > 0 else 0.0
+            self._rbw_worst = min(float(getattr(self, "_rbw_worst", 0.0)), r)
+            w = float(self._rbw_worst)
+            sess = int(getattr(self, "_rbw_sessions", 0))
+            if sess > n:
+                self._disarm_rebalance_window_loss_cut()
+                return None
+            if anchor > 0 and 1 <= sess <= n and w <= -thr:
+                return self._snapshot_suspend_post_reentry(
+                    date,
+                    portfolio_value,
+                    "REBALANCE_WINDOW_LOSS_CUT",
+                    "REBALANCE_WINDOW_LOSS_TRIGGERED",
+                    (
+                        f"🚨 {date.date()} | REBALANCE WINDOW LOSS | "
+                        f"Pire clôture vs ancre rebalance: {w:.1%} <= -{thr:.1%} "
+                        f"(séance {sess}/{n}, post-rebal) | "
+                        f"Trading SUSPENDU — toutes les positions liquidées en cash"
+                    ),
+                )
+            return None
+
+        self._rbw_sessions = int(getattr(self, "_rbw_sessions", 0)) + 1
+        sess = int(self._rbw_sessions)
+        r = float(portfolio_value) / anchor - 1.0 if anchor > 0 else 0.0
+        self._rbw_worst = min(float(getattr(self, "_rbw_worst", 0.0)), r)
+        w = float(self._rbw_worst)
+        self._rbw_last_eval_session_date = date
+        if sess > n:
+            self._disarm_rebalance_window_loss_cut()
+            return None
+        if anchor > 0 and 1 <= sess <= n and w <= -thr:
+            return self._snapshot_suspend_post_reentry(
+                date,
+                portfolio_value,
+                "REBALANCE_WINDOW_LOSS_CUT",
+                "REBALANCE_WINDOW_LOSS_TRIGGERED",
+                (
+                    f"🚨 {date.date()} | REBALANCE WINDOW LOSS | "
+                    f"Pire clôture vs ancre rebalance: {w:.1%} <= -{thr:.1%} "
+                    f"(séance {sess}/{n}) | "
+                    f"Trading SUSPENDU — toutes les positions liquidées en cash"
+                ),
+            )
+        return None
+
+    def apply_post_rebalance_recut_check(
+        self,
+        date: pd.Timestamp,
+        portfolio_value: float,
+        current_positions: dict,
+    ):
+        """Appelé par le moteur après exécution same-bar des ordres de rebalance."""
+        if not REBALANCE_FILL_SAME_BAR:
+            return None
+        if REBALANCE_WINDOW_LOSS_CUT_ENABLED:
+            self._arm_rebalance_window_loss_cut(date, float(portfolio_value))
+            snap = self._eval_rebalance_window_loss_cut(
+                date, portfolio_value, current_positions, same_bar_rebalance_followup=True
+            )
+            if snap is not None:
+                return snap
+        return self._eval_post_reentry_recut(
+            date, portfolio_value, current_positions, same_bar_rebalance_followup=True
+        )
 
     # ─────────────────────────────────────────────────────────
     # MÉTHODE PRINCIPALE : update() — à appeler chaque jour
@@ -334,6 +628,113 @@ class EventDrivenRiskManager:
         snapshot.current_drawdown = current_drawdown
         snapshot.peak_value       = self.peak_value
 
+        def _compute_fast_dd(window_days: int) -> float:
+            w = int(max(1, window_days))
+            if len(self._portfolio_values) < 2:
+                return 0.0
+            arr = np.array(list(self._portfolio_values)[-min(len(self._portfolio_values), (w + 1)) :], dtype=float)
+            local_peak = float(np.max(arr))
+            if local_peak <= 0:
+                return 0.0
+            return float(arr[-1] / local_peak - 1.0)
+
+        def _suspend(reason: str, alert: str, log_message: str) -> RiskSnapshot:
+            self.trading_suspended = True
+            self._underwater_streak = 0
+            self._fast_dd_breach_streak = 0
+            self._suspension_date = date
+            self._cash_at_exit = portfolio_value
+            self._reentry_regime_ok_days = 0
+            snapshot.regime = MarketRegime.SUSPENDED
+            snapshot.regime_score_raw = 0.0
+            snapshot.trading_suspended = True
+            snapshot.dd_max_stop = True
+            snapshot.risk_scaling = 0.0
+            snapshot.regime_score = 0.0
+            snapshot.current_drawdown = current_drawdown
+            snapshot.peak_value = self.peak_value
+            snapshot.suspension_reason = reason
+            snapshot.suspended_days = 0
+            snapshot.alerts.append(alert)
+            logger.critical(log_message)
+            return snapshot
+
+        # ── ÉTAPE 3 : Buffer rendements cross-actifs ─────────
+        # Pour le filtre de corrélation, on a besoin des
+        # rendements journaliers de TOUS les actifs.
+        # On les calcule ici si prev_prices est fourni.
+        if prev_prices is not None and len(prev_prices) > 0:
+            common = prices.index.intersection(prev_prices.index)
+            if len(common) > 1:
+                asset_rets = (prices[common] / prev_prices[common] - 1).fillna(0)
+                self._returns_buffer.append(asset_rets.values)
+
+        # Benchmark proxy utilisé par le trend filter.
+        bm_value = float(prices.mean())
+        self._benchmark_buffer.append(bm_value)
+
+        # ── Post-réentrée : recut (voir _eval_post_reentry_recut) + garde-fou pic local ─
+        if (not self.trading_suspended) and hasattr(self, "_reentry_date"):
+            days_since_reentry_cal = int((date - self._reentry_date).days)
+            recut_n = int(max(1, SUSPENSION_POST_REENTRY_RECUT_SESSION_DAYS))
+            max_wait_no_invest = int(max(1, SUSPENSION_POST_REENTRY_RECUT_MAX_CALENDAR_WAIT_NO_INVEST))
+
+            snap_recut = self._eval_post_reentry_recut(date, portfolio_value, current_positions)
+            if snap_recut is not None:
+                return snap_recut
+
+            if SUSPENSION_POST_REENTRY_GUARD_ENABLED and hasattr(self, "_reentry_peak_value"):
+                guard_days = int(max(0, SUSPENSION_POST_REENTRY_GUARD_CALENDAR_DAYS))
+                self._reentry_peak_value = max(float(self._reentry_peak_value), float(portfolio_value))
+                dd_from_reentry_peak = float(portfolio_value - self._reentry_peak_value) / (
+                    float(self._reentry_peak_value) + 1e-8
+                )
+                if days_since_reentry_cal <= guard_days and dd_from_reentry_peak <= float(
+                    SUSPENSION_POST_REENTRY_GUARD_DD
+                ):
+                    return _suspend(
+                        reason="POST_REENTRY_GUARDRAIL_BREACH",
+                        alert="POST_REENTRY_GUARDRAIL_TRIGGERED",
+                        log_message=(
+                            f"🚨 {date.date()} | POST-REENTRY GUARDRAIL | "
+                            f"DD post-reentry: {dd_from_reentry_peak:.1%} <= {float(SUSPENSION_POST_REENTRY_GUARD_DD):.1%} | "
+                            f"Trading SUSPENDU — toutes les positions liquidées en cash"
+                        ),
+                    )
+
+            sess = int(getattr(self, "_reentry_sessions_since", 0))
+            anchor = getattr(self, "_reentry_anchor_value", None)
+            recut_window_done = (not SUSPENSION_POST_REENTRY_RECUT_ENABLED) or (
+                anchor is not None and sess > recut_n
+            ) or (
+                SUSPENSION_POST_REENTRY_RECUT_ENABLED
+                and anchor is None
+                and days_since_reentry_cal > max_wait_no_invest
+            )
+            guard_days = int(max(0, SUSPENSION_POST_REENTRY_GUARD_CALENDAR_DAYS))
+            guard_window_done = (not SUSPENSION_POST_REENTRY_GUARD_ENABLED) or (
+                days_since_reentry_cal > guard_days
+            )
+            if recut_window_done and guard_window_done:
+                del self._reentry_date
+                if hasattr(self, "_reentry_peak_value"):
+                    del self._reentry_peak_value
+                if hasattr(self, "_reentry_anchor_value"):
+                    del self._reentry_anchor_value
+                if hasattr(self, "_reentry_sessions_since"):
+                    del self._reentry_sessions_since
+                if hasattr(self, "_reentry_worst_vs_anchor"):
+                    del self._reentry_worst_vs_anchor
+                if hasattr(self, "_reentry_last_eval_session_date"):
+                    del self._reentry_last_eval_session_date
+
+        if not self.trading_suspended:
+            snap_rbw = self._eval_rebalance_window_loss_cut(
+                date, portfolio_value, current_positions, same_bar_rebalance_followup=False
+            )
+            if snap_rbw is not None:
+                return snap_rbw
+
         # ── Circuit breaker : déjà suspendu depuis un jour précédent ─
         if self.trading_suspended:
             # CONDITION DE RÉENTRÉE :
@@ -352,12 +753,45 @@ class EventDrivenRiskManager:
 
             days_suspended = (date - self._suspension_date).days
             dd_since_exit  = (portfolio_value - self._cash_at_exit) / (self._cash_at_exit + 1e-8)
-            COOLDOWN_DAYS  = 30   # attendre 30 jours calendaires minimum
-            REENTRY_DD     = -0.05  # réentrer si perte < 5% depuis la sortie
+            cd = int(SUSPENSION_COOLDOWN_CALENDAR_DAYS)
+            r_dd = float(SUSPENSION_REENTRY_DD_FROM_EXIT)
+            fd = int(SUSPENSION_REENTRY_FAST_CALENDAR_DAYS)
+            f_dd = float(SUSPENSION_REENTRY_FAST_DD_FROM_EXIT)
+            allowed_regimes = {str(x).upper() for x in SUSPENSION_REENTRY_ALLOWED_RISK_REGIMES}
+            min_regime_days = int(max(1, SUSPENSION_REENTRY_MIN_CONSECUTIVE_RISK_DAYS))
 
-            if days_suspended >= COOLDOWN_DAYS and dd_since_exit > REENTRY_DD:
+            trend_score = self._compute_trend_score()
+            vol_short, vol_long, vol_ratio = self._compute_vol_metrics()
+            vol_score = self._compute_vol_score(vol_ratio)
+            avg_corr, corr_score = self._compute_corr_metrics()
+            # En suspension, la validation de réentrée doit regarder l'état
+            # depuis la sortie cash, pas le drawdown global historique.
+            reentry_dd_score = self._compute_dd_score(float(dd_since_exit))
+            reentry_score = float(min(trend_score, vol_score, corr_score, reentry_dd_score))
+            reentry_target_regime = self._classify_regime(reentry_score)
+            if reentry_target_regime.name.upper() in allowed_regimes:
+                self._reentry_regime_ok_days += 1
+            else:
+                self._reentry_regime_ok_days = 0
+
+            reenter_ok = False
+            if fd > 0 and days_suspended >= fd and dd_since_exit > f_dd:
+                reenter_ok = True
+            elif days_suspended >= cd and dd_since_exit > r_dd:
+                reenter_ok = True
+            if reenter_ok and SUSPENSION_REENTRY_REQUIRE_REGIME_CONFIRMATION:
+                reenter_ok = self._reentry_regime_ok_days >= min_regime_days
+
+            if reenter_ok:
                 self.trading_suspended = False
+                self._underwater_streak = 0
                 self.peak_value        = portfolio_value  # reset peak au niveau cash
+                self._reentry_date = date
+                self._reentry_peak_value = float(portfolio_value)
+                # Recut : ancre au 1er jour avec positions (souvent après le prochain rebalance)
+                self._reentry_anchor_value = None
+                self._reentry_sessions_since = 0
+                self._reentry_regime_ok_days = 0
                 del self._suspension_date
                 del self._cash_at_exit
                 logger.info(
@@ -375,54 +809,100 @@ class EventDrivenRiskManager:
                 snapshot.regime_score      = 0.0
                 snapshot.current_drawdown  = current_drawdown
                 snapshot.peak_value        = self.peak_value
-                snapshot.suspension_reason = "COOLDOWN_ACTIVE"
+                cooldown_ok = (
+                    (fd > 0 and days_suspended >= fd and dd_since_exit > f_dd)
+                    or (days_suspended >= cd and dd_since_exit > r_dd)
+                )
+                if not cooldown_ok:
+                    snapshot.suspension_reason = "COOLDOWN_ACTIVE"
+                elif SUSPENSION_REENTRY_REQUIRE_REGIME_CONFIRMATION:
+                    snapshot.suspension_reason = "REENTRY_REGIME_NOT_CONFIRMED"
+                else:
+                    snapshot.suspension_reason = "COOLDOWN_ACTIVE"
                 snapshot.suspended_days    = int(days_suspended)
                 snapshot.alerts.append("TRADING_SUSPENDED")
+                snapshot.trend_score = trend_score
+                snapshot.vol_score = vol_score
+                snapshot.corr_score = corr_score
+                snapshot.dd_score = reentry_dd_score
+                snapshot.regime_score = reentry_score
+                snapshot.regime = MarketRegime.SUSPENDED
+                snapshot.vol_short = vol_short
+                snapshot.vol_long = vol_long
+                snapshot.vol_ratio = vol_ratio
+                snapshot.avg_correlation = avg_corr
                 return snapshot
 
         # ── Premier déclenchement du circuit breaker ──────────
         # On vérifie ICI, avant de calculer quoi que ce soit d'autre.
         # Si DD dépasse le seuil → suspension immédiate + log unique.
+        risk_off_like = self._risk_regime_current in (
+            MarketRegime.STRESS,
+            MarketRegime.CRISIS,
+            MarketRegime.SUSPENDED,
+        )
+        fast_cut_window = (
+            int(FAST_DRAWDOWN_CUT_WINDOW_DAYS_RISK_OFF)
+            if risk_off_like
+            else int(FAST_DRAWDOWN_CUT_WINDOW_DAYS)
+        )
+        fast_dd = _compute_fast_dd(fast_cut_window)
+        fast_dd_long = _compute_fast_dd(int(FAST_DRAWDOWN_CUT_WINDOW_DAYS_LONG))
         if current_drawdown < -MAX_PORTFOLIO_DRAWDOWN:
-            self.trading_suspended = True
-            self._suspension_date = date
-            self._cash_at_exit = portfolio_value
-            snapshot.regime            = MarketRegime.SUSPENDED
-            snapshot.regime_score_raw  = 0.0
-            snapshot.trading_suspended = True
-            snapshot.dd_max_stop       = True
-            snapshot.risk_scaling      = 0.0
-            snapshot.regime_score      = 0.0
-            snapshot.current_drawdown  = current_drawdown
-            snapshot.peak_value        = self.peak_value
-            snapshot.suspension_reason = "MAX_DRAWDOWN_BREACH"
-            snapshot.suspended_days    = 0
-            snapshot.alerts.append("CIRCUIT_BREAKER_TRIGGERED")
-            logger.critical(
-                f"🚨 {date.date()} | CIRCUIT BREAKER DÉCLENCHÉ | "
-                f"DD: {current_drawdown:.1%} > seuil -{MAX_PORTFOLIO_DRAWDOWN:.0%} | "
-                f"Trading SUSPENDU — toutes les positions liquidées en cash"
+            return _suspend(
+                reason="MAX_DRAWDOWN_BREACH",
+                alert="CIRCUIT_BREAKER_TRIGGERED",
+                log_message=(
+                    f"🚨 {date.date()} | CIRCUIT BREAKER DÉCLENCHÉ | "
+                    f"DD: {current_drawdown:.1%} > seuil -{MAX_PORTFOLIO_DRAWDOWN:.0%} | "
+                    f"Trading SUSPENDU — toutes les positions liquidées en cash"
+                ),
             )
-            return snapshot
 
-        # ── ÉTAPE 3 : Buffer rendements cross-actifs ─────────
-        # Pour le filtre de corrélation, on a besoin des
-        # rendements journaliers de TOUS les actifs.
-        # On les calcule ici si prev_prices est fourni.
-        if prev_prices is not None and len(prev_prices) > 0:
-            # Rendement simple journalier par actif
-            common = prices.index.intersection(prev_prices.index)
-            if len(common) > 1:
-                asset_rets = (prices[common] / prev_prices[common] - 1).fillna(0)
-                self._returns_buffer.append(asset_rets.values)
+        stress_like = self._risk_regime_current in (MarketRegime.STRESS, MarketRegime.CRISIS)
+        fast_dd_eligible_short = (not FAST_DRAWDOWN_CUT_ONLY_UNDER_STRESS) or stress_like
+        # Horizon long : toujours évalué (grind en BULL/NORMAL). Seul le court est soumis à ONLY_UNDER_STRESS.
+        fast_dd_eligible_long = True
+        fast_dd_short_breach = fast_dd_eligible_short and (
+            fast_dd <= -float(FAST_DRAWDOWN_CUT_THRESHOLD)
+        )
+        fast_dd_long_breach = fast_dd_eligible_long and (
+            fast_dd_long <= -float(FAST_DRAWDOWN_CUT_THRESHOLD_LONG)
+        )
+        fast_dd_breach = bool(fast_dd_short_breach or fast_dd_long_breach)
+        if FAST_DRAWDOWN_CUT_ENABLED and fast_dd_breach:
+            self._fast_dd_breach_streak += 1
+        else:
+            self._fast_dd_breach_streak = 0
+        if (
+            FAST_DRAWDOWN_CUT_ENABLED
+            and fast_dd_breach
+            and self._fast_dd_breach_streak >= int(max(1, FAST_DRAWDOWN_CUT_CONFIRM_DAYS))
+        ):
+            short_txt = f"{fast_cut_window}j {fast_dd:.1%}<=-{float(FAST_DRAWDOWN_CUT_THRESHOLD):.1%}"
+            long_txt = (
+                f"{int(FAST_DRAWDOWN_CUT_WINDOW_DAYS_LONG)}j {fast_dd_long:.1%}"
+                f"<=-{float(FAST_DRAWDOWN_CUT_THRESHOLD_LONG):.1%}"
+            )
+            short_gate = "ok" if fast_dd_eligible_short else "blocked_stress_only"
+            return _suspend(
+                reason="FAST_DRAWDOWN_BREACH",
+                alert="FAST_DRAWDOWN_BREAKER_TRIGGERED",
+                log_message=(
+                    f"🚨 {date.date()} | FAST DRAWDOWN CUT | "
+                    f"{short_txt} | {long_txt} | "
+                    f"confirm={self._fast_dd_breach_streak}j | "
+                    f"(risk_regime={self._risk_regime_current.name} | short_gate={short_gate} | "
+                    f"DD_global={current_drawdown:.1%}) | "
+                    f"Trading SUSPENDU — toutes les positions liquidées en cash"
+                ),
+            )
 
         # ── ÉTAPE 4 : Calcul des 4 filtres ───────────────────
 
         # Filtre 1 — Trend (MA200 du benchmark)
         # Benchmark proxy : moyenne équipondérée des prix normalisés
         # (identique à risk_enhanced.py)
-        bm_value = float(prices.mean())
-        self._benchmark_buffer.append(bm_value)
         trend_score = self._compute_trend_score()
 
         # Filtre 2 — Volatilité (ratio vol court / vol long)
@@ -464,11 +944,32 @@ class EventDrivenRiskManager:
 
         # COMPOSANT 2 : Facteur régime
         # La réduction d'exposition liée au régime est appliquée côté signal
-        # (event_driven.py) via `apply_regime_weight_filter`, pour éviter
+        # (event_driven.engine) via `apply_regime_weight_filter`, pour éviter
         # toute double pénalisation.
         # Ici, on ne garde que le vol-targeting.
         # Cap légèrement plus strict pour limiter le tail risk
         risk_scaling = float(np.clip(vol_scaling, 0.10, 1.40))
+
+        prolonged_uw = False
+        if PROLONGED_UNDERWATER_ENABLED:
+            if current_drawdown < 0.0:
+                self._underwater_streak += 1
+            else:
+                self._underwater_streak = 0
+            if self._underwater_streak > int(PROLONGED_UNDERWATER_MIN_DAYS) and current_drawdown <= float(
+                PROLONGED_UNDERWATER_MIN_DD
+            ):
+                risk_scaling = float(
+                    np.clip(risk_scaling * float(PROLONGED_UNDERWATER_RISK_SCALE_MULT), 0.08, 1.40)
+                )
+                prolonged_uw = True
+
+        if SUSPENSION_REENTRY_RAMP_ENABLED and hasattr(self, "_reentry_date"):
+            ramp_scales = tuple(float(x) for x in SUSPENSION_REENTRY_RAMP_SCALES)
+            if len(ramp_scales) > 0:
+                days_since_reentry = max(0, int((date - self._reentry_date).days))
+                idx = min(days_since_reentry, len(ramp_scales) - 1)
+                risk_scaling = float(np.clip(risk_scaling * ramp_scales[idx], 0.08, 1.40))
 
         # ── ÉTAPE 7 : Stop-loss individuels ──────────────────
         positions_to_close = self._check_stop_losses(
@@ -489,6 +990,7 @@ class EventDrivenRiskManager:
         snapshot.avg_correlation  = avg_corr
         snapshot.risk_scaling     = risk_scaling
         snapshot.positions_to_close = positions_to_close
+        snapshot.prolonged_underwater_active = prolonged_uw
 
         # Log résumé (tous les 21 jours environ)
         if len(self._port_returns_long) % 21 == 0:
@@ -685,20 +1187,27 @@ class EventDrivenRiskManager:
         SEUILS PROGRESSIFS :
           DD > 20% → score = 0.00 (circuit breaker total)
           DD > 15.5% → score = 0.25 (réduction forte)
-          DD > 12% → score = 0.50 (réduction modérée)
-          DD > 8%  → score = 0.75 (réduction douce)
-          DD ≤ 8%  → score = 1.00 (normal)
+          DD > 12% → score = 0.50
+          DD > 9% → score = 0.52 (< seuil NORMAL 0.55 → STRESS si ce filtre domine)
+          DD > 6% → score = 0.75
+          DD ≤ 6% → score = 1.00
 
         NOTE : current_drawdown est NÉGATIF (ex: -0.15 = -15%)
         On travaille avec la valeur absolue pour les comparaisons.
         """
         dd_abs = abs(current_drawdown)
 
-        if   dd_abs > 0.20: return 0.00
-        elif dd_abs > 0.155: return 0.25
-        elif dd_abs > 0.12: return 0.50
-        elif dd_abs > 0.08: return 0.75
-        else:               return 1.00
+        if dd_abs > 0.20:
+            return 0.00
+        if dd_abs > 0.155:
+            return 0.25
+        if dd_abs > 0.12:
+            return 0.50
+        if dd_abs > 0.09:
+            return 0.52
+        if dd_abs > 0.06:
+            return 0.75
+        return 1.00
 
     # ─────────────────────────────────────────────────────────
     # CLASSIFICATION DU RÉGIME
@@ -811,7 +1320,7 @@ class EventDrivenRiskManager:
 
 class MomentumSignalGeneratorV2:
     """
-    Version améliorée du MomentumSignalGenerator de event_driven.py.
+    Version améliorée du MomentumSignalGenerator (event_driven.signal_generator).
 
     AMÉLIORATIONS vs l'original :
       1. Vol EWMA par actif → vol parity weighting (comme momentum_signal.py)
@@ -953,9 +1462,8 @@ class MomentumSignalGeneratorV2:
             dict { symbol: poids } ou {} si pas de signal valide
         """
         # Si le trading est suspendu → aucune position
-        rebal_threshold, rebal_threshold_context = resolve_market_rebalance_threshold(
-            market_regime_state
-        )
+        rebal_threshold = float(REBALANCE_THRESHOLD_DEFAULT)
+        rebal_threshold_context = "DEFAULT"
         # DD-aware rebalancing threshold (asymétrique) :
         # - si dd_score est mauvais (drawdown dangereux) -> on baisse le threshold => on retrade
         #   davantage pour désendetter/resserrer rapidement (meilleur contrôle du tail risk).
@@ -1112,7 +1620,9 @@ class MomentumSignalGeneratorV2:
             new_weights  = weights_new,
             prev_weights = self._prev_weights,
             threshold    = rebal_threshold_dd_aware,
+            market_regime_state=market_regime_state,
         )
+        weights = self._apply_regime_net_exposure_target(weights, market_regime_state)
         diagnostics["rebal_threshold"] = float(rebal_threshold_dd_aware)
         diagnostics["rebal_threshold_context"] = str(rebal_threshold_context)
         diagnostics["gross_after_rebal_threshold"] = float(sum(abs(w) for w in weights.values()))
@@ -1195,6 +1705,7 @@ class MomentumSignalGeneratorV2:
         new_weights   : dict,
         prev_weights  : dict,
         threshold     : float = 0.015,
+        market_regime_state: str = "",
     ) -> dict:
         """
         Ne retourne que les poids qui ont changé au-delà du seuil.
@@ -1217,10 +1728,20 @@ class MomentumSignalGeneratorV2:
             dict des poids finaux (anciens poids conservés si Δw < seuil)
         """
         filtered = {}
+        regime_name = str(market_regime_state or "").strip().upper()
+        candidate_weights = self._apply_risk_off_derisk_only(new_weights, prev_weights, regime_name)
 
         # Actifs avec un nouveau signal
-        for symbol, w_new in new_weights.items():
+        for symbol, w_new in candidate_weights.items():
             w_prev = prev_weights.get(symbol, 0.0)
+            if (
+                REBALANCE_FORCE_SIGN_FLIP_EXECUTION
+                and abs(w_prev) > 0.002
+                and abs(w_new) > 0.002
+                and (w_new * w_prev) < 0.0
+            ):
+                filtered[symbol] = w_new
+                continue
             if abs(w_new - w_prev) >= threshold:
                 filtered[symbol] = w_new   # changement significatif → on retrade
             else:
@@ -1229,17 +1750,68 @@ class MomentumSignalGeneratorV2:
 
         # Actifs à fermer (dans prev mais plus dans new)
         for symbol, w_prev in prev_weights.items():
-            if symbol not in new_weights and abs(w_prev) > 0.002:
+            if symbol not in candidate_weights and abs(w_prev) > 0.002:
                 # Le signal a disparu → on ferme (Δw = w_prev → toujours > seuil)
                 filtered[symbol] = 0.0
 
         return {s: w for s, w in filtered.items() if abs(w) > 0.002}
 
+    def _apply_risk_off_derisk_only(self, new_weights: dict, prev_weights: dict, regime_name: str) -> dict:
+        if not RISK_OFF_ONLY_DERISK_ENABLED or regime_name != "RISK_OFF":
+            return dict(new_weights)
+
+        out: dict[str, float] = {}
+        for symbol, w_new in new_weights.items():
+            w_prev = float(prev_weights.get(symbol, 0.0))
+            w_new = float(w_new)
+            if abs(w_prev) <= 0.002:
+                continue
+            if w_prev * w_new < 0.0:
+                continue
+            if abs(w_new) <= abs(w_prev):
+                out[symbol] = w_new
+            else:
+                out[symbol] = w_prev
+        return {s: w for s, w in out.items() if abs(w) > 0.002}
+
+    def _apply_regime_net_exposure_target(self, weights: dict, market_regime_state: str) -> dict:
+        if not REGIME_NET_EXPOSURE_TARGET_ENABLED or not weights:
+            return dict(weights)
+
+        regime = str(market_regime_state or "").strip().upper()
+        regime_bounds = {
+            "RISK_OFF": (float(REGIME_NET_TARGET_RISK_OFF_MIN), float(REGIME_NET_TARGET_RISK_OFF_MAX)),
+            "TRANSITION": (float(REGIME_NET_TARGET_TRANSITION_MIN), float(REGIME_NET_TARGET_TRANSITION_MAX)),
+            "TREND": (float(REGIME_NET_TARGET_TREND_MIN), float(REGIME_NET_TARGET_TREND_MAX)),
+            "RISK_ON": (float(REGIME_NET_TARGET_RISK_ON_MIN), float(REGIME_NET_TARGET_RISK_ON_MAX)),
+        }
+        if regime not in regime_bounds:
+            return dict(weights)
+
+        min_net, max_net = regime_bounds[regime]
+        out = dict(weights)
+        net = float(sum(out.values()))
+
+        if net > max_net:
+            excess = net - max_net
+            long_sum = float(sum(w for w in out.values() if w > 0))
+            if long_sum > 1e-12:
+                keep = max(0.0, (long_sum - excess) / long_sum)
+                out = {k: (v * keep if v > 0 else v) for k, v in out.items()}
+        elif net < min_net:
+            deficit = min_net - net
+            short_abs_sum = float(sum(-w for w in out.values() if w < 0))
+            if short_abs_sum > 1e-12:
+                keep = max(0.0, (short_abs_sum - deficit) / short_abs_sum)
+                out = {k: (v * keep if v < 0 else v) for k, v in out.items()}
+
+        return {s: w for s, w in out.items() if abs(w) > 0.002}
+
 
 # ============================================================
 # SECTION 4 — INTÉGRATION DANS L'ENGINE EVENT-DRIVEN
 # ============================================================
-# Instructions pour modifier event_driven.py :
+# Instructions pour modifier event_driven/engine.py :
 #
 # REMPLACER :
 #   self.signal_gen = MomentumSignalGenerator(self.data_handler)

@@ -24,6 +24,7 @@ htmlcov/
 
 # --- IDE (optional local overrides) ---
 .idea/
+.claude/
 
 # --- Secrets ---
 .env

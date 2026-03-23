@@ -1,66 +1,68 @@
-quant_strategies/
-├── config.py              ← Paramètres globaux (port, IP, account)
+# Notes projet Fist
+
+**Comment lancer le projet :** voir le fichier racine **`README.md`** (points d’entrée officiels et commandes).
+
+---
+
+## Structure actuelle du dépôt (code)
+
+```
+Fist/
+├── config.py                    ← Paramètres globaux (IBKR, univers, signal, risque, chemins)
+├── README.md                    ← Entrées officielles + prérequis
+├── baseline_event_driven_reference.json
+├── run_backtest.py              ← Pipeline backtest vectorisé (maître)
+├── event_driven/                ← Package backtest event-driven + CLI (`python -m event_driven`)
+├── docs/event_driven.md         ← Carte du package
+├── event_driven_live.py         ← Dashboard animé (Plotly)
+├── event_driven_risk.py         ← Test / démo risk manager event-driven
+├── optimizer.py                 ← Optimisation walk-forward (démo __main__)
+├── validator.py                 ← Validation WF + Monte Carlo
+├── visualizer.py                ← Exports graphiques
+├── dashboard_live.py            ← Streamlit (streamlit run …)
+├── risk_enhanced.py             ← Filtres régime (phase 2B, expérimental / lib)
 ├── data/
-│   └── ibkr_data.py       ← Connexion IBKR + récupération données
-├── strategies/
-│   └── momentum/
-│       ├── signal.py      ← Construction du signal
-│       ├── portfolio.py   ← Sizing & pondération
-│       └── backtest.py    ← Moteur de backtest
+│   ├── ibkr_data.py             ← Connexion IBKR + cache raw / processed
+│   ├── raw/                     ← CSV téléchargés (gitignore)
+│   └── processed/               ← price_matrix.csv (gitignore)
+├── strategies/momentum/
+│   ├── momentum_signal.py
+│   ├── portfolio.py
+│   └── backtest_vectorized.py
 ├── risk/
-│   └── risk_manager.py    ← Contrôle du risque
-└── metrics/
-    └── performance.py     ← Sharpe, Drawdown, etc.
+│   ├── regime_*.py, overlay.py, rebalance.py, risk_types.py
+│   └── risk_manager.py
+├── metrics/performance.py
+└── tests/                       ← pytest
+```
 
-Pour backtest : 
+---
 
-PHASE 1 — Vectorisé (maintenant)
-├── backtest_vectorized.py    ← moteur rapide pour le research
-├── performance.py            ← métriques Sharpe, DD, Calmar...
-└── Test + validation complète
+## Roadmap (objectifs produit)
 
-PHASE 2 — Event-Driven (après)
-├── backtest_eventdriven.py   ← simulation réaliste jour par jour
-├── visualizer.py             ← dashboard live en temps réel
-└── Test + comparaison avec vectorisé
+### PHASE 1 — Vectorisé
+- `strategies/momentum/backtest_vectorized.py` — moteur rapide research  
+- `metrics/performance.py` — Sharpe, DD, Calmar…  
+- Tests + validation
 
-Optimisation de la stratégie : 
+### PHASE 2 — Event-driven
+- `event_driven/` — simulation réaliste jour par jour (`python -m event_driven`)  
+- `visualizer.py` / dashboards — lecture des résultats  
+- Comparaison avec le vectorisé
 
-PHASE 2A — Optimisation du signal
-├── Calibration des fenêtres momentum (21/63/126/252)
-├── Optimisation des poids CS vs TS
-├── Filtrage de l'univers (liquidité, qualité)
-└── Walk-forward validation (éviter l'overfitting)
+### PHASE 2A — Optimisation du signal
+- Calibration fenêtres momentum (21/63/126/252)  
+- Poids CS vs TS, filtrage univers, walk-forward (éviter overfitting)
 
-PHASE 2B — Amélioration du risk management  
-├── Réduction du Max Drawdown (-34% → < -20%)
-├── Optimisation du vol targeting
-├── Ajout d'un filtre de régime de marché
-└── Stop-loss dynamiques
+### PHASE 2B — Risk management
+- Max DD, vol targeting, filtre régime, stops dynamiques  
+- Code dispersé entre `risk/` et expérimentations (`risk_enhanced.py`, etc.)
 
-PHASE 2C — Réduction des coûts ( Phase passer car la phase 2.B fait déja en grande partie ce que l'on attendait de la 2.C )
-├── Optimisation du turnover (76% → < 40%)
-├── Seuil de rebalancement adaptatif
-└── Modélisation du market impac 
+### PHASE 2C — Coûts
+- Turnover, seuil rebalancement adaptatif, market impact
 
-PHASE 2D — Validation statistique
-├── Walk-forward backtest (out-of-sample)
-├── Monte Carlo stress testing
-├── Analyse de robustesse des paramètres
-└── Comparaison avec benchmarks institutionnels
+### PHASE 2D — Validation statistique
+- Walk-forward OOS, Monte Carlo, robustesse paramètres, benchmarks
 
-PHASE 3 — Ghost test
-└── Seulement si Sharpe > 0.5 et Max DD < 20%
-
-
-
-
-
-
-Problèmes a fix : 
-
-- Gestion de régimes, identification des régimes mais transition trop lente, si crise -> réduire sans attendre le rebal mensuel.
-- Réentrée après CB 30 jours après mais n'a jamais de réel confirmation du marché -> ajout de confirmation du marché, on doit mettre en place un pré CB. Réduction progressive du risque dès -5%, ne pas attendre 10% ou 15% de pertes. La réentrer après CB doit etre basée sur le régime + vol + momentum, pas sur le temps. 
-- Cap levier, 1.5x uniquement si volatilité basse confirmer sinon max 1.2x
-- Kill switch intraday, si perte journalière > X -> stop immédiat
-- Réfléchir a comment réduire le rebal mensuel ( turnover/an = 1145.7% )
+### PHASE 3 — Ghost test
+- Seulement si Sharpe > 0.5 et Max DD < 20 % (critères indicatifs dans ta doc historique)
