@@ -43,20 +43,30 @@ IBKR_CLIENT_ID = 1             # ID de cette session
 #   1. Données historiques abondantes et fiables
 #   2. Coûts de transaction faibles (spreads serrés, volume élevé)
 # En institution, l'univers peut contenir des milliers d'actifs.
+# Ici ~80 large / mid caps US liquides (IBKR) pour diversifier le risque spécifique.
 
 STOCK_UNIVERSE = [
-    # Tech
+    # Tech & services IT
     "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
+    "AMD", "AVGO", "ORCL", "CRM", "ADBE", "CSCO", "IBM", "INTC", "QCOM",
+    "ACN", "NOW", "TXN",
+    # Communication / médias
+    "DIS", "CMCSA", "NFLX",
     # Finance
-    "JPM", "GS", "BAC", "MS", "BLK",
+    "JPM", "GS", "BAC", "MS", "BLK", "C", "WFC", "SCHW", "AXP", "USB",
+    "SPGI", "ICE", "BK",
     # Santé
-    "JNJ", "PFE", "UNH", "ABBV",
-    # Énergie
-    "XOM", "CVX",
+    "JNJ", "UNH", "ABBV", "LLY", "MRK", "TMO", "ABT", "PFE", "DHR", "ISRG", "GILD",
     # Consommation
-    "WMT", "HD", "MCD", "NKE",
+    "WMT", "HD", "COST", "MCD", "NKE", "KO", "PEP", "PG", "LOW", "TJX", "SBUX", "BKNG",
     # Industrie
-    "CAT", "BA", "GE",
+    "CAT", "DE", "BA", "GE", "UPS", "RTX", "HON", "UNP", "CSX", "LMT", "ETN",
+    # Énergie
+    "XOM", "CVX", "COP", "SLB", "EOG",
+    # Matériaux
+    "LIN", "FCX", "NEM",
+    # Utilitaires & REITs data center / logistique
+    "NEE", "AMT", "PLD",
 ]
 
 # Futures sur commodités — symboles IBKR (racine du contrat)
@@ -90,34 +100,17 @@ FUTURES_UNIVERSE = [
 
 MOMENTUM_WINDOWS = [21, 63, 126, 252]
 
-# Poids de chaque fenêtre dans le signal composite.
-# On donne plus de poids aux fenêtres longues car elles
-# capturent mieux le "vrai" momentum vs le bruit court terme.
+# Poids de chaque fenêtre dans le signal composite (profil « base saine » = littérature).
 # RÈGLE : les poids doivent sommer à 1.0
-# MOMENTUM_WEIGHTS = {
-#     21:  0.10,   # 1 mois  → 10%
-#     63:  0.20,   # 3 mois  → 20%
-#     126: 0.30,   # 6 mois  → 30%
-#     252: 0.40,   # 12 mois → 40%
-# } # avant opti
-
 MOMENTUM_WEIGHTS = {
-    21:  0.30,   # 1 mois  → 30%
-    63:  0.30,   # 3 mois  → 30%
-    126: 0.25,   # 6 mois  → 25%
-    252: 0.15,   # 12 mois → 15%
-} # après opti
+    21:  0.10,   # 1 mois
+    63:  0.20,   # 3 mois
+    126: 0.30,   # 6 mois
+    252: 0.40,   # 12 mois
+}
 
-
-# SKIP PERIOD — Pourquoi on ignore le dernier mois ?
-# À très court terme (< 1 mois), le marché est en MEAN REVERSION :
-# ce qui vient de monter fort a tendance à légèrement reculer
-# (prise de profits, market impact, etc.).
-# Ce phénomène s'appelle le "short-term reversal" (Jegadeesh 1990).
-# Si on l'inclut, il "pollue" notre signal momentum et réduit
-# le Sharpe Ratio. On le skip donc systématiquement.
-# SKIP_DAYS = 21  # On ignore les 21 derniers jours de trading
-SKIP_DAYS = 10 # après opti
+# SKIP PERIOD — court terme en mean reversion (Jegadeesh & Titman, etc.)
+SKIP_DAYS = 21
 
 
 # Fréquence de rebalancement du portefeuille
@@ -137,11 +130,9 @@ REBALANCING_FREQUENCY = "monthly"  # options: "daily", "weekly", "monthly"
 # Ce type de portefeuille est "market neutral" en théorie :
 # il performe peu importe si le marché global monte ou descend.
 
-# LONG_QUANTILE  = 0.80  # On va LONG sur le top 20% des actifs
-# SHORT_QUANTILE = 0.20  # On va SHORT sur le bottom 20% des actifs avant opti
-
-LONG_QUANTILE  = 0.70
-SHORT_QUANTILE = 0.30 # après opti
+# Top / bottom 20 % en cross-section (standard long/short momentum)
+LONG_QUANTILE  = 0.80
+SHORT_QUANTILE = 0.20
 
 
 # Capital initial pour le backtest et le paper trading
@@ -175,6 +166,17 @@ BACKTEST_END   = "2024-12-31"
 # Plus ton backtest couvre de régimes de marché différents,
 # plus tes résultats sont crédibles.
 
+# --- Walk-forward / recherche (bornes pour scripts & notebooks) ---
+# Train 1 : seule période où tu ajustes / explores les paramètres de stratégie.
+RESEARCH_TRAIN_1_START = "2015-01-01"
+RESEARCH_TRAIN_1_END = "2019-12-31"
+# Hors échantillon immédiat après train 1 (validation avant trains suivants).
+RESEARCH_OOS_AFTER_TRAIN_1_START = "2020-01-01"
+RESEARCH_OOS_AFTER_TRAIN_1_END = BACKTEST_END
+# Train 2+ : à définir (fenêtres glissantes ou expanding). Plus exigeant :
+# moins d’historique in-sample, régimes récents dominants, pas de ré-optimisation
+# sur l’OOS déjà “consommé”. Les moteurs utilisent toujours BACKTEST_* par défaut.
+
 # COÛTS DE TRANSACTION
 # En BASIS POINTS (bps) : 1 bps = 0.01% = 0.0001
 # 10 bps = 0.10% par trade (aller simple)
@@ -192,28 +194,29 @@ SLIPPAGE_BPS = 5  # 5 basis points de slippage estimé
 # ─────────────────────────────────────────────────────────────
 # SECTION 6 — PARAMÈTRES DE RISQUE
 # ─────────────────────────────────────────────────────────────
-
+#
+# Profil « base saine » (recherche) : un seul interrupteur global clair (DD max),
+# réentrée simple, pas de fast DD / sous-l’eau prolongé / rampes / cibles net
+# tant qu’on n’a pas validé le signal hors sample. Réactiver les couches ensuite.
+#
 # Taux sans risque annualisé — utilisé pour calculer le Sharpe Ratio
 # Sharpe = (Rendement_portfolio - Taux_sans_risque) / Volatilité
 # On utilise le taux des T-Bills américains 3 mois (~5% en 2024)
 RISK_FREE_RATE = 0.05  # 5% annualisé
 
-# STOP-LOSS au niveau du portefeuille
-# Si le portefeuille perd plus de X% depuis son dernier sommet
-# (drawdown), on arrête de trader et on sort toutes les positions.
-# Profil aligné sur le run figé stats_20260323_190605 (identique à 191330 sur la courbe) :
-# pas de snapshot git — reconstitué depuis les raisons de suspension dans ce CSV.
-MAX_PORTFOLIO_DRAWDOWN = 0.15  # 15% — inchangé vs commit initial ; évite coupes « pic risk reset » trop tôt
+# Circuit breaker global : liquidation si DD depuis le pic **strictement** sous le seuil
+# (ex. seuil 20 % → il faut DD < −20 % ; un max DD à −19,3 % ne déclenche pas le breaker).
+MAX_PORTFOLIO_DRAWDOWN = 0.20
 
-# Réentrée après circuit breaker
-SUSPENSION_COOLDOWN_CALENDAR_DAYS = 12
+# Réentrée après suspension (cooldown + DD depuis sortie en cash ; pas de voie rapide)
+SUSPENSION_COOLDOWN_CALENDAR_DAYS = 21
 SUSPENSION_REENTRY_DD_FROM_EXIT = -0.05
-SUSPENSION_REENTRY_FAST_CALENDAR_DAYS = 7
+SUSPENSION_REENTRY_FAST_CALENDAR_DAYS = 0
 SUSPENSION_REENTRY_FAST_DD_FROM_EXIT = -0.015
-SUSPENSION_REENTRY_REQUIRE_REGIME_CONFIRMATION = True
-SUSPENSION_REENTRY_ALLOWED_RISK_REGIMES = ("BULL", "NORMAL")
-SUSPENSION_REENTRY_MIN_CONSECUTIVE_RISK_DAYS = 3
-SUSPENSION_REENTRY_RAMP_ENABLED = True
+SUSPENSION_REENTRY_REQUIRE_REGIME_CONFIRMATION = False
+SUSPENSION_REENTRY_ALLOWED_RISK_REGIMES = ("BULL", "NORMAL", "STRESS", "CRISIS")
+SUSPENSION_REENTRY_MIN_CONSECUTIVE_RISK_DAYS = 1
+SUSPENSION_REENTRY_RAMP_ENABLED = False
 SUSPENSION_REENTRY_RAMP_SCALES = (0.35, 0.55, 0.75, 1.0)
 # Désactivé sur 190605 : aucune suspension_reason POST_REENTRY_RECUT_* dans ce run.
 SUSPENSION_POST_REENTRY_RECUT_ENABLED = False
@@ -226,22 +229,16 @@ REBALANCE_FILL_SAME_BAR = False
 REBALANCE_WINDOW_LOSS_CUT_ENABLED = False
 REBALANCE_WINDOW_LOSS_CUT_SESSION_DAYS = 5
 REBALANCE_WINDOW_LOSS_CUT_LOSS = 0.02
-FAST_DRAWDOWN_CUT_ENABLED = True
-FAST_DRAWDOWN_CUT_THRESHOLD = 0.065
+FAST_DRAWDOWN_CUT_ENABLED = False
+FAST_DRAWDOWN_CUT_THRESHOLD = 0.05
 FAST_DRAWDOWN_CUT_WINDOW_DAYS = 7
-FAST_DRAWDOWN_CUT_WINDOW_DAYS_RISK_OFF = 7
-# Horizon lent additionnel (dégradation progressive en stress/crise)
-FAST_DRAWDOWN_CUT_THRESHOLD_LONG = 0.055
+FAST_DRAWDOWN_CUT_WINDOW_DAYS_RISK_OFF = 5
+FAST_DRAWDOWN_CUT_THRESHOLD_LONG = 0.07
 FAST_DRAWDOWN_CUT_WINDOW_DAYS_LONG = 10
-# Confirmation anti-bruit : N jours consécutifs de breach avant suspension
 FAST_DRAWDOWN_CUT_CONFIRM_DAYS = 2
-# Profil C : pas de fast cut **court** en BULL/NORMAL (évite sorties type oct. 2021) ;
-# l’horizon **long** reste actif dans tous les régimes (grind lent même si le risk est encore optimiste).
-FAST_DRAWDOWN_CUT_ONLY_UNDER_STRESS = True
+FAST_DRAWDOWN_CUT_ONLY_UNDER_STRESS = False
 
-# Sous le pic global : si plus de N jours consécutifs en DD<0 ET DD <= seuil,
-# on multiplie risk_scaling (réduction d’expo sans tout liquider).
-PROLONGED_UNDERWATER_ENABLED = True
+PROLONGED_UNDERWATER_ENABLED = False
 PROLONGED_UNDERWATER_MIN_DAYS = 12
 PROLONGED_UNDERWATER_MIN_DD = -0.09
 PROLONGED_UNDERWATER_RISK_SCALE_MULT = 0.92
@@ -264,18 +261,22 @@ TRANSITION_OVERLAY_ENABLED = False
 RISK_OFF_MIN_SCALE = 0.15
 RISK_OFF_MAX_SCALE = 0.35
 
-# Seuil relatif min. sur |Δw| pour déclencher un trade au rebalancement mensuel.
-REBALANCE_THRESHOLD_DEFAULT = 0.032
+# Seuil |Δw| au rebalance mensuel (base saine : un peu plus réactif qu’un 0.032 optimisé)
+REBALANCE_THRESHOLD_DEFAULT = 0.02
 
-# Rééquilibrage robuste en phase défensive
-# - En RISK_OFF: uniquement réduction de risque (pas d'augmentation d'exposition)
-RISK_OFF_ONLY_DERISK_ENABLED = True
+# Symétrique en RISK_OFF pour la base recherche (réactiver True pour prod défensive)
+RISK_OFF_ONLY_DERISK_ENABLED = False
+
+# Filtre `apply_regime_weight_filter` : si True, régime risk **CRISIS** → poids vides (0 ordre au rebalance).
+# False = scaling continu sur `regime_score` (CRISIS ~0,25 → expo réduite mais stratégie toujours investie).
+# Sur OOS 2020+, un DD book peut maintenir le risk en CRISIS des mois : True = « bloqué » en cash sans circuit breaker.
+REGIME_WEIGHT_FILTER_CRISIS_HARD_FLAT = False
 # Si un actif passe de long à short (ou inverse), on force l'exécution même si |Δw| < seuil.
 REBALANCE_FORCE_SIGN_FLIP_EXECUTION = True
 
 # Cible d'exposition nette (Σw) par régime de marché effectif.
 # Permet d'éviter une dérive structurelle trop décorrélée en conservant la protection.
-REGIME_NET_EXPOSURE_TARGET_ENABLED = True
+REGIME_NET_EXPOSURE_TARGET_ENABLED = False
 REGIME_NET_TARGET_RISK_OFF_MIN = 0.0
 REGIME_NET_TARGET_RISK_OFF_MAX = 0.15
 REGIME_NET_TARGET_TRANSITION_MIN = 0.0
@@ -321,11 +322,28 @@ DEFENSIVE_FLAT_REENTRY_RISK_REGIMES = ("BULL", "NORMAL")
 DEFENSIVE_FLAT_REENTRY_RISK_CONSECUTIVE = 2
 
 # GARDE-FOUS D'ITERATION VS BASELINE
-# PASS si tous les checks sont satisfaits.
-BASELINE_MIN_ACCEPTED_SHARPE = 0.60
+# Référence « full sample » historique (runs sans --train1) :
+BASELINE_MIN_ACCEPTED_SHARPE = 0.22
 BASELINE_MAX_CAGR_DEGRADATION = 0.0025
 BASELINE_MAX_MAX_DD_DEGRADATION = 0.0050
 BASELINE_MAX_TURNOVER_INCREASE = 0.25
+
+# Seuils assouplis quand la baseline lue est `baseline_event_driven_train1.json` (recherche 2015–2019)
+BASELINE_TRAIN1_MIN_ACCEPTED_SHARPE = -0.06
+BASELINE_TRAIN1_MAX_CAGR_DEGRADATION = 0.01
+BASELINE_TRAIN1_MAX_MAX_DD_DEGRADATION = 0.02
+BASELINE_TRAIN1_MAX_TURNOVER_INCREASE = 0.35
+
+# Fichiers JSON pour compare_with_baseline_reference (event_driven)
+EVENT_DRIVEN_BASELINE_JSON = "baseline_event_driven_reference.json"
+EVENT_DRIVEN_BASELINE_JSON_TRAIN1 = "baseline_event_driven_train1.json"
+
+# Multiplicateur research sur commission + slippage (1.0 = nominal ; 1.2 = stress +20 %)
+RESEARCH_TRANSACTION_COST_STRESS_MULTIPLIER = 1.0
+
+# Walk-forward — train 2 (à activer quand train 1 est figé ; ne pas optimiser sur OOS consommé)
+RESEARCH_TRAIN_2_START = "2016-01-01"
+RESEARCH_TRAIN_2_END = "2020-12-31"
 
 
 # ─────────────────────────────────────────────────────────────

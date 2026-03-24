@@ -652,47 +652,80 @@ class IBKRDataFetcher:
 # à la fois comme module importable ET comme script standalone.
 
 if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Télécharge les prix via IBKR TWS et écrit data/raw/*.csv + data/processed/price_matrix.csv"
+    )
+    ap.add_argument(
+        "--stocks-only",
+        action="store_true",
+        help="Uniquement STOCK_UNIVERSE (pas de futures) — adapté au book 100 %% actions",
+    )
+    ap.add_argument(
+        "--futures-only",
+        action="store_true",
+        help="Uniquement FUTURES_UNIVERSE",
+    )
+    ap.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignorer le cache local et re-télécharger chaque série",
+    )
+    cli = ap.parse_args()
+    if cli.stocks_only and cli.futures_only:
+        print("❌ Choisis --stocks-only OU --futures-only, pas les deux.")
+        raise SystemExit(1)
+
+    use_cache = not cli.no_cache
 
     print("=" * 60)
     print("  IBKR DATA FETCHER — Stratégie Momentum")
     print("=" * 60)
 
-    # 1. Initialisation
     fetcher = IBKRDataFetcher()
 
-    # 2. Connexion à TWS
     if not fetcher.connect():
         print("❌ Impossible de se connecter à TWS. Arrêt.")
-        exit(1)
+        raise SystemExit(1)
 
     try:
-        # 3. Téléchargement des données actions
-        print("\n📥 Récupération des données actions...")
-        stocks_data = fetcher.fetch_stocks_data(use_cache=True)
+        stocks_data = {}
+        futures_data = {}
 
-        # 4. Téléchargement des données futures
-        print("\n📥 Récupération des données futures...")
-        futures_data = fetcher.fetch_futures_data(use_cache=True)
+        if cli.futures_only:
+            print("\n📥 Récupération des données futures...")
+            futures_data = fetcher.fetch_futures_data(use_cache=use_cache)
+            all_data = futures_data
+        elif cli.stocks_only:
+            print("\n📥 Récupération des données actions...")
+            stocks_data = fetcher.fetch_stocks_data(use_cache=use_cache)
+            all_data = stocks_data
+        else:
+            print("\n📥 Récupération des données actions...")
+            stocks_data = fetcher.fetch_stocks_data(use_cache=use_cache)
+            print("\n📥 Récupération des données futures...")
+            futures_data = fetcher.fetch_futures_data(use_cache=use_cache)
+            all_data = {**stocks_data, **futures_data}
 
-        # 5. Fusion en matrice complète
         print("\n📊 Construction de la matrice des prix...")
-        all_data = {**stocks_data, **futures_data}  # Fusion des deux dicts
         price_matrix = fetcher.build_price_matrix(all_data)
 
-        # 6. Résumé
         print("\n" + "=" * 60)
         print("  RÉSUMÉ")
         print("=" * 60)
         print(f"  Actions récupérées : {len(stocks_data)}")
         print(f"  Futures récupérés  : {len(futures_data)}")
-        print(f"  Matrice finale     : {price_matrix.shape}")
-        print(f"  Période couverte   : "
-              f"{price_matrix.index[0].date()} → "
-              f"{price_matrix.index[-1].date()}")
-        print("\n  Aperçu de la matrice :")
-        print(price_matrix.tail())
+        if price_matrix.empty:
+            print("  Matrice finale     : (vide)")
+        else:
+            print(f"  Matrice finale     : {price_matrix.shape}")
+            print(
+                f"  Période couverte   : "
+                f"{price_matrix.index[0].date()} → {price_matrix.index[-1].date()}"
+            )
+            print("\n  Aperçu de la matrice :")
+            print(price_matrix.tail())
 
     finally:
-        # Le bloc finally s'exécute TOUJOURS, même si une erreur survient.
-        # On est ainsi sûr de toujours fermer la connexion proprement.
         fetcher.disconnect()

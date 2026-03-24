@@ -20,6 +20,13 @@
 #   # Avec paramètres personnalisés
 #   python -m run_backtest --start 2018-01-01 --end 2024-01-01
 #
+#   # IBKR : matrice = actions uniquement (sans futures)
+#   python -m run_backtest --stocks-only
+#
+#   # Données seules (reconstruit price_matrix.csv)
+#   python -m data.ibkr_data --stocks-only
+#   python -m data.ibkr_data --stocks-only --no-cache
+#
 # PRÉREQUIS :
 #   pip install ib_insync pandas numpy scipy
 #   TWS ouvert sur port 7497 (Paper Trading)
@@ -94,6 +101,7 @@ class BacktestRunner:
         initial_capital: float = INITIAL_CAPITAL,
         use_cache     : bool  = False,
         save_results  : bool  = True,
+        stocks_only   : bool  = False,
     ):
         """
         Initialise le BacktestRunner.
@@ -105,11 +113,14 @@ class BacktestRunner:
             use_cache       : utiliser les données en cache local
                               (pas besoin de TWS ouvert)
             save_results    : sauvegarder les résultats en CSV
+            stocks_only     : si False et téléchargement IBKR : inclure les futures ;
+                              si True : uniquement STOCK_UNIVERSE dans la matrice
         """
         self.start_date     = start_date
         self.end_date       = end_date
         self.initial_capital = initial_capital
         self.use_cache      = use_cache
+        self.stocks_only    = stocks_only
         self._should_save   = save_results
 
         # Dossier de résultats horodaté
@@ -198,18 +209,21 @@ class BacktestRunner:
                 logger.info(f"  Téléchargement de {len(STOCK_UNIVERSE)} actions...")
                 stocks_data = fetcher.fetch_stocks_data(
                     symbols=STOCK_UNIVERSE,
-                    use_cache=True
+                    use_cache=True,
                 )
 
-                # Téléchargement futures
-                logger.info(f"  Téléchargement de {len(FUTURES_UNIVERSE)} futures...")
-                futures_data = fetcher.fetch_futures_data(
-                    symbols=FUTURES_UNIVERSE,
-                    use_cache=True
-                )
+                if self.stocks_only:
+                    futures_data = {}
+                    logger.info("  Mode stocks-only : pas de téléchargement futures.")
+                    all_data = dict(stocks_data)
+                else:
+                    logger.info(f"  Téléchargement de {len(FUTURES_UNIVERSE)} futures...")
+                    futures_data = fetcher.fetch_futures_data(
+                        symbols=FUTURES_UNIVERSE,
+                        use_cache=True,
+                    )
+                    all_data = {**stocks_data, **futures_data}
 
-                # Construction de la matrice
-                all_data     = {**stocks_data, **futures_data}
                 price_matrix = fetcher.build_price_matrix(all_data)
 
                 if price_matrix.empty:
@@ -573,6 +587,7 @@ Exemples :
   python -m run_backtest --start 2018-01-01       # Depuis 2018
   python -m run_backtest --capital 500000         # Capital de 500k$
   python -m run_backtest --no-risk-scaling        # Sans vol targeting
+  python -m run_backtest --stocks-only            # IBKR sans futures
         """
     )
 
@@ -612,6 +627,12 @@ Exemples :
         default=False,
         help="Ne pas sauvegarder les résultats"
     )
+    parser.add_argument(
+        "--stocks-only",
+        action="store_true",
+        default=False,
+        help="IBKR : matrice = actions uniquement (STOCK_UNIVERSE), sans futures",
+    )
 
     return parser.parse_args()
 
@@ -631,6 +652,7 @@ if __name__ == "__main__":
     print(f"  Période  : {args.start} → {args.end}")
     print(f"  Capital  : {args.capital:,.0f}$")
     print(f"  Cache    : {'OUI' if args.use_cache else 'NON (IBKR live)'}")
+    print(f"  Actions  : {'uniquement' if args.stocks_only else '+ futures si IBKR'}")
     print(f"  Vol tgt  : {'NON' if args.no_risk_scaling else 'OUI'}")
     print("=" * 60 + "\n")
 
@@ -641,6 +663,7 @@ if __name__ == "__main__":
         initial_capital = args.capital,
         use_cache      = args.use_cache,
         save_results   = not args.no_save,
+        stocks_only    = args.stocks_only,
     )
 
     # Lancement du pipeline complet

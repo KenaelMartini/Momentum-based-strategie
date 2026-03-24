@@ -14,7 +14,17 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 
-from config import INITIAL_CAPITAL, REBALANCE_FILL_SAME_BAR, RISK_FREE_RATE
+from config import (
+    BACKTEST_END,
+    BACKTEST_START,
+    EVENT_DRIVEN_BASELINE_JSON,
+    INITIAL_CAPITAL,
+    REBALANCE_FILL_SAME_BAR,
+    RESEARCH_TRANSACTION_COST_STRESS_MULTIPLIER,
+    RISK_FREE_RATE,
+    SLIPPAGE_BPS,
+    TRANSACTION_COST_BPS,
+)
 from risk import (
     DefensiveFlatController,
     RegimeEngine,
@@ -28,7 +38,7 @@ from risk import (
 )
 
 from .baseline import compare_with_baseline_reference, evaluate_baseline_verdict
-from .broker import COMMISSION_RATE, SLIPPAGE_RATE, SimulatedBroker
+from .broker import SimulatedBroker
 from .data_handler import DataHandler
 from .events import FillEvent, OrderEvent, PortfolioStats, Signal, SignalEvent
 from .portfolio import Portfolio
@@ -60,16 +70,36 @@ class EventDrivenEngine:
     def __init__(
         self,
         data_path,
-        start_date="2016-01-01",
-        end_date="2024-12-31",
+        start_date=None,
+        end_date=None,
         initial_capital=INITIAL_CAPITAL,
         live_viz=False,
         output_dir="./results/event_driven",
         per_day_callback: PerDayCallback = None,
         day_sleep_sec: float = 0.0,
+        baseline_reference_path: Path | str | None = None,
+        skip_baseline_comparison: bool = False,
+        transaction_cost_stress_multiplier: float | None = None,
+        rebalance_threshold: float | None = None,
+        skip_strategy_benchmark_report: bool = False,
     ):
+        if start_date is None:
+            start_date = BACKTEST_START
+        if end_date is None:
+            end_date = BACKTEST_END
+
+        self._skip_baseline_comparison = bool(skip_baseline_comparison)
+        if skip_baseline_comparison:
+            self._baseline_reference_path = None
+        elif baseline_reference_path is not None:
+            self._baseline_reference_path = Path(baseline_reference_path)
+        else:
+            self._baseline_reference_path = Path(EVENT_DRIVEN_BASELINE_JSON)
+
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._data_path = Path(data_path)
+        self._skip_strategy_benchmark_report = bool(skip_strategy_benchmark_report)
         self.live_viz = live_viz
         self.per_day_callback = per_day_callback
         self.day_sleep_sec = float(day_sleep_sec)
@@ -78,9 +108,22 @@ class EventDrivenEngine:
 
         self.data_handler = DataHandler(data_path, start_date, end_date)
         self.risk_manager = EventDrivenRiskManager(initial_capital)
-        self.signal_gen = MomentumSignalGeneratorV2(self.data_handler, self.risk_manager)
+        self.signal_gen = MomentumSignalGeneratorV2(
+            self.data_handler,
+            self.risk_manager,
+            rebalance_threshold=rebalance_threshold,
+        )
         self.portfolio = Portfolio(initial_capital)
-        self.broker = SimulatedBroker()
+        _cm = (
+            float(transaction_cost_stress_multiplier)
+            if transaction_cost_stress_multiplier is not None
+            else float(RESEARCH_TRANSACTION_COST_STRESS_MULTIPLIER)
+        )
+        _cm = max(_cm, 1e-9)
+        self.broker = SimulatedBroker(
+            commission_rate=(TRANSACTION_COST_BPS / 10_000) * _cm,
+            slippage_rate=(SLIPPAGE_BPS / 10_000) * _cm,
+        )
         self.visualizer = LiveVisualizer3D(update_every=21)
         self.market_regime_engine = RegimeEngine(track_history=True)
         self.defensive_flat_ctrl = DefensiveFlatController()
@@ -92,6 +135,8 @@ class EventDrivenEngine:
         self.final_metrics = {}
         self.rebal_diagnostics = []
         self.prev_prices = None
+        self._prev_trading_suspended = False
+        self._rebalance_immediately_after_reentry = False
 
     def run(self) -> dict:
         logger.info("\n" + "=" * 60)
@@ -125,6 +170,11 @@ class EventDrivenEngine:
                 entry_prices={t: self.portfolio.prices.get(t, 0) for t in self.portfolio.positions},
                 prev_prices=self.prev_prices,
             )
+            suspended_now = bool(getattr(risk_snapshot, "trading_suspended", False))
+            if self._prev_trading_suspended and not suspended_now:
+                self._rebalance_immediately_after_reentry = True
+            self._prev_trading_suspended = suspended_now
+
             self.signal_gen.update_ewma_vol(prices, self.prev_prices)
             regime_score = risk_snapshot.regime_score
             risk_regime_name = getattr(getattr(risk_snapshot, "regime", None), "name", "NORMAL")
@@ -208,8 +258,8 @@ class EventDrivenEngine:
                         p = self.portfolio.prices.get(symbol, 0)
                         if p > 0:
                             direction = 1 if -qty > 0 else -1
-                            fill_price = p * (1 + direction * SLIPPAGE_RATE * 2)
-                            commission = abs(qty) * fill_price * COMMISSION_RATE
+                            fill_price = p * (1 + direction * self.broker.slippage_rate * 2)
+                            commission = abs(qty) * fill_price * self.broker.commission_rate
                             fill = FillEvent(
                                 date=date,
                                 ticker=symbol,
@@ -236,8 +286,12 @@ class EventDrivenEngine:
             rebal_today = self.last_rebal_date is None or (
                 (date.year * 12 + date.month) > (self.last_rebal_date.year * 12 + self.last_rebal_date.month)
             )
+            if self._rebalance_immediately_after_reentry:
+                rebal_today = True
 
             if rebal_today and not risk_snapshot.trading_suspended:
+                if self._rebalance_immediately_after_reentry:
+                    self._rebalance_immediately_after_reentry = False
                 self.last_rebal_date = date
 
                 eff_regime = aligned_market_regime or feature_market_state
@@ -421,8 +475,8 @@ class EventDrivenEngine:
                         p = self.portfolio.prices.get(symbol, 0)
                         if p > 0:
                             direction = 1 if -qty > 0 else -1
-                            fill_price = p * (1 + direction * SLIPPAGE_RATE * 2)
-                            commission = abs(qty) * fill_price * COMMISSION_RATE
+                            fill_price = p * (1 + direction * self.broker.slippage_rate * 2)
+                            commission = abs(qty) * fill_price * self.broker.commission_rate
                             fill = FillEvent(
                                 date=date,
                                 ticker=symbol,
@@ -694,13 +748,38 @@ class EventDrivenEngine:
             perf_effective_df.to_csv(path_legacy, index=False)
             files["regime_performance"] = str(path_legacy)
 
-        baseline_comparison = compare_with_baseline_reference(self.final_metrics)
+        baseline_comparison = None
+        if (
+            not self._skip_baseline_comparison
+            and self._baseline_reference_path is not None
+            and self._baseline_reference_path.exists()
+        ):
+            baseline_comparison = compare_with_baseline_reference(
+                self.final_metrics,
+                baseline_path=self._baseline_reference_path,
+            )
         if baseline_comparison is not None:
             baseline_path = self.output_dir / f"baseline_comparison_{ts}.json"
             with baseline_path.open("w", encoding="utf-8") as handle:
                 json.dump(baseline_comparison, handle, indent=2)
             logger.info(f"  Comparaison baseline : {baseline_path}")
             files["baseline_comparison"] = str(baseline_path)
+
+        if not self._skip_strategy_benchmark_report:
+            try:
+                from .strategy_benchmark_compare import build_report_html
+
+                bh_html = self.output_dir / f"strategy_vs_benchmark_{ts}.html"
+                build_report_html(
+                    stats_path,
+                    self._data_path,
+                    bh_html,
+                    initial_capital=float(self.portfolio.initial_capital),
+                )
+                files["strategy_vs_benchmark"] = str(bh_html)
+                logger.info(f"  Rapport strategie vs benchmark EW : {bh_html}")
+            except Exception as exc:
+                logger.warning("  Rapport strategie vs benchmark EW omis : %s", exc)
 
         return files
 

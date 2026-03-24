@@ -43,7 +43,7 @@ class _FakeRiskManager:
 
 
 class _FakeSignalGeneratorV2:
-    def __init__(self, data_handler, risk_manager):
+    def __init__(self, data_handler, risk_manager, rebalance_threshold=None, **kwargs):
         self.data_handler = data_handler
         self.risk_manager = risk_manager
         self.last_diagnostics = {"rebal_threshold": 0.03, "signal_reason": "test"}

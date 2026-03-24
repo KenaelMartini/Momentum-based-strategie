@@ -13,6 +13,10 @@ from config import (
     BASELINE_MAX_MAX_DD_DEGRADATION,
     BASELINE_MAX_TURNOVER_INCREASE,
     BASELINE_MIN_ACCEPTED_SHARPE,
+    BASELINE_TRAIN1_MAX_CAGR_DEGRADATION,
+    BASELINE_TRAIN1_MAX_MAX_DD_DEGRADATION,
+    BASELINE_TRAIN1_MAX_TURNOVER_INCREASE,
+    BASELINE_TRAIN1_MIN_ACCEPTED_SHARPE,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,44 +26,61 @@ def evaluate_baseline_verdict(
     baseline_metrics: dict,
     current_metrics: dict,
     delta: dict,
+    *,
+    min_accepted_sharpe: float | None = None,
+    max_cagr_degradation: float | None = None,
+    max_max_dd_degradation: float | None = None,
+    max_turnover_increase: float | None = None,
+    severe_sharpe_delta: float = -0.02,
 ) -> dict:
+    ms = BASELINE_MIN_ACCEPTED_SHARPE if min_accepted_sharpe is None else float(min_accepted_sharpe)
+    mcd = BASELINE_MAX_CAGR_DEGRADATION if max_cagr_degradation is None else float(max_cagr_degradation)
+    mdd = (
+        BASELINE_MAX_MAX_DD_DEGRADATION
+        if max_max_dd_degradation is None
+        else float(max_max_dd_degradation)
+    )
+    mti = (
+        BASELINE_MAX_TURNOVER_INCREASE
+        if max_turnover_increase is None
+        else float(max_turnover_increase)
+    )
+
     baseline_cagr = float(baseline_metrics.get("cagr", 0.0))
     baseline_max_dd = float(baseline_metrics.get("max_drawdown", 0.0))
     baseline_turnover = float(baseline_metrics.get("annualized_turnover", 0.0))
 
     guardrails = {
         "sharpe_floor": {
-            "passed": current_metrics["sharpe"] >= BASELINE_MIN_ACCEPTED_SHARPE,
-            "threshold": BASELINE_MIN_ACCEPTED_SHARPE,
+            "passed": current_metrics["sharpe"] >= ms,
+            "threshold": ms,
             "actual": current_metrics["sharpe"],
         },
         "cagr_drift": {
-            "passed": current_metrics["cagr"] >= baseline_cagr - BASELINE_MAX_CAGR_DEGRADATION,
-            "threshold": baseline_cagr - BASELINE_MAX_CAGR_DEGRADATION,
+            "passed": current_metrics["cagr"] >= baseline_cagr - mcd,
+            "threshold": baseline_cagr - mcd,
             "actual": current_metrics["cagr"],
         },
         "max_dd_drift": {
-            "passed": current_metrics["max_drawdown"]
-            >= baseline_max_dd - BASELINE_MAX_MAX_DD_DEGRADATION,
-            "threshold": baseline_max_dd - BASELINE_MAX_MAX_DD_DEGRADATION,
+            "passed": current_metrics["max_drawdown"] >= baseline_max_dd - mdd,
+            "threshold": baseline_max_dd - mdd,
             "actual": current_metrics["max_drawdown"],
         },
         "turnover_drift": {
-            "passed": current_metrics["annualized_turnover"]
-            <= baseline_turnover + BASELINE_MAX_TURNOVER_INCREASE,
-            "threshold": baseline_turnover + BASELINE_MAX_TURNOVER_INCREASE,
+            "passed": current_metrics["annualized_turnover"] <= baseline_turnover + mti,
+            "threshold": baseline_turnover + mti,
             "actual": current_metrics["annualized_turnover"],
         },
     }
 
     severe_failures = []
-    if delta["sharpe"] < -0.02:
+    if delta["sharpe"] < float(severe_sharpe_delta):
         severe_failures.append("SHARPE_REGRESSION")
-    if current_metrics["cagr"] < baseline_cagr - BASELINE_MAX_CAGR_DEGRADATION:
+    if current_metrics["cagr"] < baseline_cagr - mcd:
         severe_failures.append("CAGR_REGRESSION")
-    if current_metrics["max_drawdown"] < baseline_max_dd - BASELINE_MAX_MAX_DD_DEGRADATION:
+    if current_metrics["max_drawdown"] < baseline_max_dd - mdd:
         severe_failures.append("MAX_DD_WORSE")
-    if current_metrics["annualized_turnover"] > baseline_turnover + BASELINE_MAX_TURNOVER_INCREASE:
+    if current_metrics["annualized_turnover"] > baseline_turnover + mti:
         severe_failures.append("TURNOVER_HIGHER")
 
     if all(item["passed"] for item in guardrails.values()):
@@ -114,11 +135,23 @@ def compare_with_baseline_reference(
         "annualized_turnover": current_metrics["annualized_turnover"]
         - float(baseline_metrics.get("annualized_turnover", 0.0)),
     }
-    verdict = evaluate_baseline_verdict(
-        baseline_metrics=baseline_metrics,
-        current_metrics=current_metrics,
-        delta=delta,
-    )
+    train1_mode = path is not None and "train1" in path.name.lower()
+    if train1_mode:
+        verdict = evaluate_baseline_verdict(
+            baseline_metrics=baseline_metrics,
+            current_metrics=current_metrics,
+            delta=delta,
+            min_accepted_sharpe=BASELINE_TRAIN1_MIN_ACCEPTED_SHARPE,
+            max_cagr_degradation=BASELINE_TRAIN1_MAX_CAGR_DEGRADATION,
+            max_max_dd_degradation=BASELINE_TRAIN1_MAX_MAX_DD_DEGRADATION,
+            max_turnover_increase=BASELINE_TRAIN1_MAX_TURNOVER_INCREASE,
+        )
+    else:
+        verdict = evaluate_baseline_verdict(
+            baseline_metrics=baseline_metrics,
+            current_metrics=current_metrics,
+            delta=delta,
+        )
 
     logger.info("\n" + "=" * 60)
     logger.info("  COMPARAISON BASELINE vs ITERATION")

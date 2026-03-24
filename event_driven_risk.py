@@ -1350,6 +1350,7 @@ class MomentumSignalGeneratorV2:
         skip_days       : int   = SKIP_DAYS,
         long_quantile   : float = LONG_QUANTILE,
         short_quantile  : float = SHORT_QUANTILE,
+        rebalance_threshold: float | None = None,
     ):
         self.data        = data_handler
         self.risk_mgr    = risk_manager
@@ -1358,6 +1359,14 @@ class MomentumSignalGeneratorV2:
         self.long_q      = long_quantile
         self.short_q     = short_quantile
         self.max_window  = max(self.weights.keys())
+        self._rebal_threshold_base = (
+            float(rebalance_threshold)
+            if rebalance_threshold is not None
+            else float(REBALANCE_THRESHOLD_DEFAULT)
+        )
+        self._rebal_threshold_context_base = (
+            "RESEARCH_OVERRIDE" if rebalance_threshold is not None else "DEFAULT"
+        )
 
         # Buffer EWMA des volatilités par actif
         # λ = 0.94 (standard RiskMetrics — JP Morgan, 1994)
@@ -1462,8 +1471,8 @@ class MomentumSignalGeneratorV2:
             dict { symbol: poids } ou {} si pas de signal valide
         """
         # Si le trading est suspendu → aucune position
-        rebal_threshold = float(REBALANCE_THRESHOLD_DEFAULT)
-        rebal_threshold_context = "DEFAULT"
+        rebal_threshold = float(self._rebal_threshold_base)
+        rebal_threshold_context = str(self._rebal_threshold_context_base)
         # DD-aware rebalancing threshold (asymétrique) :
         # - si dd_score est mauvais (drawdown dangereux) -> on baisse le threshold => on retrade
         #   davantage pour désendetter/resserrer rapidement (meilleur contrôle du tail risk).

@@ -26,8 +26,26 @@ def apply_regime_weight_filter(
     regime_name = getattr(getattr(risk_snapshot, "regime", None), "name", "NORMAL")
     regime_score = float(getattr(risk_snapshot, "regime_score", 0.75) or 0.75)
 
-    # Hard-flat en crise extrême (conservateur pour le tail risk).
-    if regime_name in {"CRISIS", "SUSPENDED"}:
+    try:
+        import config as _cfg
+
+        crisis_hard_flat = bool(getattr(_cfg, "REGIME_WEIGHT_FILTER_CRISIS_HARD_FLAT", True))
+    except ImportError:
+        crisis_hard_flat = True
+
+    # Suspension explicite : toujours flat.
+    if regime_name == "SUSPENDED":
+        crisis_meta = {
+            "applied_scale": 0.0,
+            "regime_name": regime_name,
+            "regime_score": regime_score,
+            "hard_flat": True,
+            "trend_tilt_mult": 1.0,
+        }
+        return ({}, crisis_meta) if return_meta else {}
+
+    # CRISIS : hard-flat optionnel (tail risk prod) vs scaling continu (recherche momentum).
+    if regime_name == "CRISIS" and crisis_hard_flat:
         crisis_meta = {
             "applied_scale": 0.0,
             "regime_name": regime_name,

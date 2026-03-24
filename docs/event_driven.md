@@ -16,7 +16,59 @@ python -m event_driven.regime_phase_report --results-dir ./results/event_driven
 
 Sur la vue temporelle, une courbe **benchmark** (buy-and-hold **équipondéré** sur `price_matrix.csv`, même capital initial que le backtest) est superposée à la stratégie. Désactiver : `--no-benchmark`. Autre fichier de prix : `--price-matrix ./chemin/price_matrix.csv`.
 
-Options : `--start`, `--end`, `--live`, `--data`, `--output`.
+Options : `--start`, `--end`, `--train1`, `--oos1`, `--baseline-json`, `--skip-baseline`, `--stress-cost-mult`, `--rebalance-threshold`, `--skip-strategy-benchmark-report`, `--live`, `--data`, `--output`. Sans option : **`BACKTEST_START` / `BACKTEST_END`**.
+
+- **`--train1`** : compare aux métriques de [`baseline_event_driven_train1.json`](../baseline_event_driven_train1.json) si le fichier existe.
+- **`--oos1`** : par défaut **pas** de comparaison baseline (période ≠ train 1). Forcer avec `--baseline-json chemin.json`.
+- **`--stress-cost-mult 1.2`** : commission + slippage × 1,2 (robustesse coûts sur train 1).
+- **`--rebalance-threshold 0.03`** : surcharge temporaire du seuil mensuel (sinon `REBALANCE_THRESHOLD_DEFAULT` dans `config.py`) pour sweeps train 1.
+
+Diagnostic CSV après un run :
+
+```bash
+python -m event_driven.research_diagnose ./results/event_driven/stats_YYYYMMDD_HHMMSS.csv
+```
+
+Sweeps **bloc risque** sur train 1 (patchs config en RAM uniquement ; voir journal dans `perso.md`) :
+
+```bash
+python -m event_driven.research_risk_train1 --output-root ./results/risk_train1_plan
+```
+
+À chaque fin de run `python -m event_driven`, un rapport **HTML** est généré automatiquement : **`strategy_vs_benchmark_<timestamp>.html`** dans `--output` (stratégie vs buy-and-hold équipondéré sur `--data`, mêmes dates que le `stats_*.csv`). Désactiver : `--skip-strategy-benchmark-report`.
+
+Équivalent manuel (même contenu) :
+
+```bash
+python -m event_driven.strategy_benchmark_compare --results-dir ./results/event_driven
+# ou : --stats ./results/event_driven/stats_YYYYMMDD_HHMMSS.csv --output ./results/mon_rapport.html
+```
+
+## Workflow recherche (train 1)
+
+1. **Gel** : n’optimiser que sur `--train1` ; l’OOS `--oos1` sert à valider une variante **déjà choisie** (voir `perso.md`).
+2. **Référence** : métriques figées dans `baseline_event_driven_train1.json` + garde-fous `BASELINE_*` dans `config.py`.
+3. **Itération par blocs** : un seul type de changement à la fois — **signal** (quantiles, seuils, poids) → **coûts** (`TRANSACTION_COST_BPS`, stress) → **risk** (overlay, DD max).
+4. **Robustesse** : `python -m event_driven --train1 --stress-cost-mult 1.2` avant un run OOS figé.
+5. **Train 2+** : bornes `RESEARCH_TRAIN_2_*` dans `config.py` pour walk-forward ultérieur.
+
+Après une **réentrée** suite au circuit breaker DD max, le moteur force un **rebalancement le jour même** (sinon tu pouvais rester en cash jusqu’au prochain mois si la suspension avait sauté des dates de rebalance).
+
+Si les logs montrent **`Old regime: 0.00x`** et **`Orders: 0`** alors que le risk est en **CRISIS** : ce n’est en général **pas** le circuit breaker, c’est le **hard-flat** dans `apply_regime_weight_filter` (`risk/overlay.py`). Désactive ce blocage avec **`REGIME_WEIGHT_FILTER_CRISIS_HARD_FLAT = False`** dans `config.py` pour garder une exposition réduite (scaling sur `regime_score`) au lieu de zéro ordre pendant des mois.
+
+Comparer l’univers aux colonnes de `price_matrix.csv` :
+
+```bash
+python -c "import config,pandas as pd;c=set(config.STOCK_UNIVERSE);df=pd.read_csv('data/processed/price_matrix.csv',nrows=0);m=set(df.columns)-{'date'};print('manquants',sorted(c-m));print('en trop',sorted(m-c))"
+```
+
+## Profil « base saine » (recherche)
+
+Dans `config.py`, ce profil sert de **point de départ** avant d’ajouter des couches (fast DD, rampes de réentrée, cibles d’exposition nette, tilt risk-informed, etc.) :
+
+- **Signal** : `MOMENTUM_WEIGHTS` 10/20/30/40, `SKIP_DAYS` 21, `LONG_QUANTILE` / `SHORT_QUANTILE` 0,80 / 0,20.
+- **Risk** : `MAX_PORTFOLIO_DRAWDOWN` 20 %, `FAST_DRAWDOWN_CUT_ENABLED` False, `PROLONGED_UNDERWATER_ENABLED` False, `SUSPENSION_REENTRY_RAMP_ENABLED` False, `REGIME_NET_EXPOSURE_TARGET_ENABLED` False, `RISK_OFF_ONLY_DERISK_ENABLED` False.
+- **Baseline** : `baseline_event_driven_reference.json` est recalé sur ce profil pour la période `BACKTEST_START` / `BACKTEST_END` (à régénérer si tu changes l’univers ou les dates).
 
 ## Modules
 

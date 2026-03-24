@@ -7,6 +7,22 @@ from event_driven_risk import EventDrivenRiskManager, MarketRegime
 from risk.overlay import apply_market_regime_overlay, apply_regime_weight_filter
 
 
+def test_regime_weight_filter_crisis_respects_hard_flat_flag(monkeypatch):
+    import config as cfg
+
+    monkeypatch.setattr(cfg, "REGIME_WEIGHT_FILTER_CRISIS_HARD_FLAT", True, raising=False)
+    snap = SimpleNamespace(regime=SimpleNamespace(name="CRISIS"), regime_score=0.25)
+    flat, meta = apply_regime_weight_filter({"AAPL": 0.1}, snap, return_meta=True)
+    assert flat == {}
+    assert meta["hard_flat"] is True
+
+    monkeypatch.setattr(cfg, "REGIME_WEIGHT_FILTER_CRISIS_HARD_FLAT", False, raising=False)
+    scaled, meta2 = apply_regime_weight_filter({"AAPL": 0.1}, snap, return_meta=True)
+    assert "AAPL" in scaled
+    assert abs(scaled["AAPL"]) > 1e-9
+    assert meta2["hard_flat"] is False
+
+
 def test_legacy_overlay_flats_suspended_regime():
     snapshot = SimpleNamespace(
         regime=SimpleNamespace(name="SUSPENDED"),
@@ -34,6 +50,7 @@ def test_market_overlay_scales_weights():
 
 
 def test_risk_manager_reports_suspended_state_and_cooldown(monkeypatch):
+    monkeypatch.setattr(edr, "MAX_PORTFOLIO_DRAWDOWN", 0.15)
     monkeypatch.setattr(edr, "SUSPENSION_REENTRY_REQUIRE_REGIME_CONFIRMATION", False)
     monkeypatch.setattr(edr, "FAST_DRAWDOWN_CUT_ENABLED", False)
     monkeypatch.setattr(edr, "SUSPENSION_REENTRY_FAST_CALENDAR_DAYS", 0)

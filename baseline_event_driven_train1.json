@@ -1,0 +1,13 @@
+{
+  "name": "event_driven_baseline_train1",
+  "captured_on": "2026-03-24",
+  "source": "Train 1 only RESEARCH_TRAIN_1_* | config actuelle (univers ~80, REGIME_WEIGHT_FILTER_CRISIS_HARD_FLAT=False) | event_driven",
+  "metrics": {
+    "cagr": 0.042602463658229395,
+    "sharpe": -0.03964296889059951,
+    "max_drawdown": -0.13523036051062898,
+    "calmar": 0.31503623518685275,
+    "trade_count": 343,
+    "annualized_turnover": 8.917277211463968
+  }
+}
